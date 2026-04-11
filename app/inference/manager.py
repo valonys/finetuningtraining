@@ -174,11 +174,21 @@ class InferenceManager:
         if name == "hf":
             from .hf_backend import HFBackend
             return HFBackend(self.base_model_id, profile=profile, lora_registry=self.lora_registry)
+        if name == "ollama":
+            from .ollama_backend import OllamaInferenceBackend
+            return OllamaInferenceBackend(self.base_model_id, profile=profile, lora_registry=self.lora_registry)
         raise ValueError(f"Unknown backend: {name}")
 
 
 def _ordered_fallback(preferred: str, hw_tier: str) -> List[str]:
-    """Ordered list of backends to try — preferred first, then sane defaults."""
+    """
+    Ordered list of backends to try — preferred first, then sane defaults.
+
+    Ollama is never auto-appended to the fallback chain: it depends on an
+    external daemon (or a cloud API key) that we can't assume is available,
+    and its LoRA semantics differ from the other backends. Users opt in via
+    `backend="ollama"` or `VALONY_INFERENCE_BACKEND=ollama`.
+    """
     order: list[str] = [preferred]
     if hw_tier == "apple_silicon":
         extras = ["mlx", "llamacpp", "hf"]

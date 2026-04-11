@@ -85,6 +85,10 @@ logger = logging.getLogger(__name__)
 job_registry: Dict[str, JobStatus] = {}
 
 DEFAULT_BASE_MODEL = os.environ.get("VALONY_BASE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+# Opt-in override — set VALONY_INFERENCE_BACKEND=ollama to route generation
+# through a local Ollama daemon or Ollama Cloud. Leave unset to let the
+# hardware profile pick (vLLM on CUDA, MLX on Apple, etc.).
+DEFAULT_INFERENCE_BACKEND = os.environ.get("VALONY_INFERENCE_BACKEND") or None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -97,9 +101,9 @@ async def lifespan(app: FastAPI):
     prof = resolve_profile(hw)
     logger.info(f"   Hardware: {hw.tier} | {hw.device_name} | mem={hw.effective_memory_gb} GB")
     logger.info(f"   Training backend: {prof.training_backend}")
-    logger.info(f"   Inference backend: {prof.inference_backend}")
+    logger.info(f"   Inference backend: {DEFAULT_INFERENCE_BACKEND or prof.inference_backend}")
     try:
-        engine = get_inference_engine(DEFAULT_BASE_MODEL)
+        engine = get_inference_engine(DEFAULT_BASE_MODEL, backend=DEFAULT_INFERENCE_BACKEND)
         logger.info(f"   ✅ Inference engine: {engine.backend}")
     except Exception as e:
         logger.warning(f"   ⚠️  Inference pre-warm skipped: {e}")
@@ -130,7 +134,7 @@ async def health():
     hw = detect_hardware()
     prof = resolve_profile(hw)
     try:
-        engine = get_inference_engine(DEFAULT_BASE_MODEL)
+        engine = get_inference_engine(DEFAULT_BASE_MODEL, backend=DEFAULT_INFERENCE_BACKEND)
         domains = engine.registered_domains
         backend = engine.backend
         stats = engine.latency_stats()
@@ -387,7 +391,7 @@ async def list_jobs():
 # ──────────────────────────────────────────────────────────────
 @app.get("/v1/domains", response_model=List[DomainInfo])
 async def list_domains():
-    engine = get_inference_engine(DEFAULT_BASE_MODEL)
+    engine = get_inference_engine(DEFAULT_BASE_MODEL, backend=DEFAULT_INFERENCE_BACKEND)
     return [
         DomainInfo(domain_name=name, adapter_path=path)
         for name, path in engine.lora_registry.items()
@@ -397,13 +401,13 @@ async def list_domains():
 @app.post("/v1/inference/reload")
 async def reload_inference():
     reset_engine()
-    engine = get_inference_engine(DEFAULT_BASE_MODEL)
+    engine = get_inference_engine(DEFAULT_BASE_MODEL, backend=DEFAULT_INFERENCE_BACKEND)
     return {"status": "reloaded", "domains": engine.registered_domains}
 
 
 @app.post("/v1/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    engine = get_inference_engine(DEFAULT_BASE_MODEL)
+    engine = get_inference_engine(DEFAULT_BASE_MODEL, backend=DEFAULT_INFERENCE_BACKEND)
 
     # Build a proper prompt using the right template for the base model
     from app.templates import get_template_for

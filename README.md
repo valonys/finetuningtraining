@@ -9,6 +9,7 @@
 | Consumer GPU | NVIDIA RTX 5090 (32 GB), 4090 (24 GB) | `unsloth` + `trl` | `vllm` / `sglang` |
 | Notebook | Google Colab (T4, L4, A100) | `unsloth` + `trl` | `vllm` / HF `transformers` |
 | Cloud | NVIDIA Brev (A10G → H100), Lambda, RunPod | `unsloth` + `trl` (+ FSDP) | `vllm` / `sglang` / TRT-LLM |
+| Hosted | Ollama Cloud (Nemotron, Llama 3.3, Qwen 2.5 72B, ...) | — (catalog) | `ollama` (streaming) |
 | CPU-only | any x86/arm64 | `trl` + `peft` (tiny models) | `llama.cpp` / `transformers` |
 
 All configuration is a single `domain_config.yaml` and everything in between
@@ -218,6 +219,43 @@ produces runaway length with no real preference signal. v3.0's
 `pair_synthesis.py` generates **real** plausible-but-wrong rejections via
 a single structured Nemotron call per prompt. That's the difference
 between a DPO dataset that ships and one that doesn't.
+
+### Serving chat from Ollama too (not just synth)
+
+Ollama can also be wired as an **inference backend**, so you can chat with
+Nemotron / Llama 3.3 / Qwen 2.5 72B directly through the Studio UI. Same
+HTTP client, just streaming instead of batch:
+
+```bash
+export OLLAMA_API_KEY=sk-your-ollama-cloud-key
+export VALONY_BASE_MODEL=nemotron             # Ollama tag, not a HF id
+export VALONY_INFERENCE_BACKEND=ollama
+bash scripts/run_studio.sh
+```
+
+**How LoRA maps on the Ollama backend** — Ollama doesn't hot-swap HF
+LoRA adapters the way vLLM / MLX / HF do. Instead, the Ollama backend
+uses `register_adapter(domain_name, ollama_tag)` to **map domain names
+to different Ollama model tags**. You get multi-domain serving without
+touching LoRA at all:
+
+```python
+from app.inference.manager import get_inference_engine
+
+engine = get_inference_engine("llama3.1", backend="ollama")
+engine.register_adapter("customer_grasps", "llama3.1")    # friendly, fast
+engine.register_adapter("asset_integrity", "qwen2.5:7b")  # technical
+engine.register_adapter("ai_llm",          "nemotron")    # Cloud-hosted
+
+# Route by domain at chat time
+engine.generate(prompt, domain_name="ai_llm")             # → nemotron
+```
+
+If you want to use a **LoRA you trained in the Studio** with the Ollama
+backend, you need to merge the adapter into the base weights, convert
+the result to GGUF, and `ollama create`/`ollama import` it into your
+local catalog. That conversion step isn't automated (yet) — for direct
+LoRA hot-swap, stick with `vllm` / `sglang` / `mlx` / `hf`.
 
 ---
 

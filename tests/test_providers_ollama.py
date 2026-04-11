@@ -114,6 +114,76 @@ def test_chat_raises_provider_error_on_401(monkeypatch):
         assert excinfo.value.status_code == 401
 
 
+def test_stream_chat_parses_sse_deltas(monkeypatch):
+    monkeypatch.setenv("OLLAMA_API_KEY", "k")
+    from app.providers.ollama import OllamaProvider
+    import json as _json
+
+    lines = [
+        f'data: {_json.dumps({"choices":[{"delta":{"content":"Hello "}}]})}',
+        f'data: {_json.dumps({"choices":[{"delta":{"content":"world"}}]})}',
+        f'data: {_json.dumps({"choices":[{"delta":{"content":"!"}}]})}',
+        "data: [DONE]",
+    ]
+
+    stream_mock = MagicMock()
+    stream_mock.status_code = 200
+    stream_mock.iter_lines.return_value = iter(lines)
+    stream_mock.__enter__ = lambda self: self
+    stream_mock.__exit__ = lambda self, *a: None
+
+    with patch("requests.post", return_value=stream_mock):
+        p = OllamaProvider()
+        deltas = list(p.stream_chat([{"role": "user", "content": "hi"}]))
+
+    assert deltas == ["Hello ", "world", "!"]
+
+
+def test_stream_chat_skips_non_data_lines(monkeypatch):
+    monkeypatch.setenv("OLLAMA_API_KEY", "k")
+    from app.providers.ollama import OllamaProvider
+    import json as _json
+
+    lines = [
+        "",                                    # empty line
+        ": heartbeat comment",                 # SSE comment
+        f'data: {_json.dumps({"choices":[{"delta":{"content":"x"}}]})}',
+        "data: not-valid-json",                # malformed — should be skipped
+        f'data: {_json.dumps({"choices":[{"delta":{"content":"y"}}]})}',
+        "data: [DONE]",
+    ]
+    stream_mock = MagicMock()
+    stream_mock.status_code = 200
+    stream_mock.iter_lines.return_value = iter(lines)
+    stream_mock.__enter__ = lambda self: self
+    stream_mock.__exit__ = lambda self, *a: None
+
+    with patch("requests.post", return_value=stream_mock):
+        p = OllamaProvider()
+        deltas = list(p.stream_chat([{"role": "user", "content": "hi"}]))
+
+    assert deltas == ["x", "y"]
+
+
+def test_stream_chat_raises_on_4xx(monkeypatch):
+    monkeypatch.setenv("OLLAMA_API_KEY", "k")
+    from app.providers.base import ProviderError
+    from app.providers.ollama import OllamaProvider
+
+    stream_mock = MagicMock()
+    stream_mock.status_code = 401
+    stream_mock.text = "Unauthorized"
+    stream_mock.iter_lines.return_value = iter([])
+    stream_mock.__enter__ = lambda self: self
+    stream_mock.__exit__ = lambda self, *a: None
+
+    with patch("requests.post", return_value=stream_mock):
+        p = OllamaProvider()
+        with pytest.raises(ProviderError) as excinfo:
+            list(p.stream_chat([{"role": "user", "content": "hi"}]))
+        assert excinfo.value.status_code == 401
+
+
 def test_chat_passes_response_format(monkeypatch):
     monkeypatch.setenv("OLLAMA_API_KEY", "k")
     from app.providers.ollama import OllamaProvider

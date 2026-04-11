@@ -137,6 +137,73 @@ class OllamaProvider(SynthProvider):
                 body=f"Malformed Ollama response: {e} | raw: {resp.text[:500]}",
             )
 
+    def stream_chat(
+        self,
+        messages: List[ChatMessage],
+        *,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        max_tokens: int = 1024,
+        stop: Optional[List[str]] = None,
+        timeout: int = 300,
+    ):
+        """
+        Stream tokens from a chat completion as they arrive.
+
+        Yields plain string deltas (not SSE frames). The inference backend
+        wraps this in a generator that also measures TTFT on the first
+        non-empty delta.
+
+        Uses the OpenAI-compatible `/v1/chat/completions?stream=true` SSE
+        endpoint, which Ollama supports on both local (`/v1`) and cloud.
+        """
+        try:
+            import requests
+        except ImportError as e:
+            raise RuntimeError("`requests` required — pip install requests") from e
+
+        body: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if stop:
+            body["stop"] = stop
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+
+        url = f"{self.base_url}/chat/completions"
+        with requests.post(url, json=body, headers=headers, stream=True, timeout=timeout) as resp:
+            if resp.status_code >= 400:
+                raise ProviderError(status_code=resp.status_code, body=resp.text)
+
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                if not raw_line.startswith("data:"):
+                    continue
+                chunk = raw_line[5:].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    data = json.loads(chunk)
+                except json.JSONDecodeError:
+                    continue
+                choices = data.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content")
+                if content:
+                    yield content
+
     def health(self) -> dict:
         """Light-touch health check. Returns {'ok': bool, ...}."""
         try:
