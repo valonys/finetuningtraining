@@ -170,3 +170,9 @@ class HealthResponse(BaseModel):
     latency_stats: dict
     available_ocr: List[str]
     available_templates: List[str]
+    synth_provider: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Active LLM provider used by the Data Forge for Q/A and "
+                    "pair synthesis (Ollama Cloud Nemotron by default when "
+                    "OLLAMA_API_KEY is set).",
+    )

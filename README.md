@@ -164,6 +164,63 @@ pip install -r requirements-cpu.txt
 
 ---
 
+## Synth provider — Ollama Cloud (Nemotron) by default
+
+The Data Forge needs a strong LLM for two things:
+
+1. **Q/A pair synthesis** — given a document chunk, generate diverse
+   `{instruction, response}` pairs for SFT.
+2. **Contrastive pair synthesis** — given an instruction, generate a
+   high-quality `chosen` and a plausible-but-wrong `rejected` for DPO / ORPO.
+
+Ollama Cloud (paid hosted service) running **Llama-3.1-Nemotron-70B** is
+the recommended default. It's dramatically cheaper than frontier APIs
+(OpenAI GPT-4, Anthropic Claude) and dramatically better than any local
+7B for high-volume synthetic data generation.
+
+### Configure (one line)
+
+```bash
+export OLLAMA_API_KEY=sk-your-ollama-cloud-key      # from ollama.com → API keys
+# Optional:
+export OLLAMA_MODEL=nemotron                        # default — or llama3.3, qwen2.5:72b, etc.
+```
+
+That's it. Once `OLLAMA_API_KEY` is set, `DataForge.build_dataset(...)`
+with `task="sft"` or `task="dpo"` will automatically route through
+Nemotron for Q/A synth and contrastive pair generation. `/healthz` reports
+the active synth provider in its response body.
+
+### Fallbacks and alternatives
+
+The provider registry (`app.providers`) auto-detects in priority order:
+
+| Env var | Provider | Default model |
+|---|---|---|
+| `OLLAMA_API_KEY` | Ollama Cloud | `nemotron` |
+| `OLLAMA_HOST` (no key) | Local Ollama daemon | `llama3.1` |
+| `OPENAI_API_KEY` | OpenAI | `gpt-4o-mini` |
+| `OPENROUTER_API_KEY` + `VALONY_SYNTH_PROVIDER=openrouter` | OpenRouter | `meta-llama/llama-3.1-70b-instruct` |
+| `VALONY_SYNTH_BASE_URL` + `VALONY_SYNTH_MODEL` | Any OpenAI-compat endpoint | *user-supplied* |
+| (nothing) | rule-based fallback | — |
+
+Force a specific provider with `VALONY_SYNTH_PROVIDER=ollama|openai|openrouter|rule_based`.
+
+See `.env.example` for a full annotated config template and
+`configs/models/model_catalog.yaml` for the curated list of synth-time
+models we recommend per domain.
+
+### Why this matters for DPO specifically
+
+The previous v2.0 DPO path used a *truncation placeholder* for the rejected
+response — training on that teaches the model "longer = better" and
+produces runaway length with no real preference signal. v3.0's
+`pair_synthesis.py` generates **real** plausible-but-wrong rejections via
+a single structured Nemotron call per prompt. That's the difference
+between a DPO dataset that ships and one that doesn't.
+
+---
+
 ## Domains — you define them, per engagement
 
 A **domain** is anything you want the model to be. No default is hardcoded.

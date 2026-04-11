@@ -55,6 +55,7 @@ from app.inference.manager import (
     get_inference_engine,
     reset_engine,
 )
+from app.providers import describe_active_provider
 from app.models import (
     ChatRequest,
     ChatResponse,
@@ -152,6 +153,7 @@ async def health():
         latency_stats=stats,
         available_ocr=list_available_engines(),
         available_templates=list_templates(),
+        synth_provider=describe_active_provider(),
     )
 
 

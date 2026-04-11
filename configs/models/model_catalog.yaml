@@ -74,3 +74,61 @@ families:
         min_vram_gb: 16
       - id: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
         min_vram_gb: 16
+
+# ──────────────────────────────────────────────────────────────
+# Synth-time models — used by the Data Forge for Q/A synthesis
+# and DPO contrastive pair generation. These are called at
+# dataset-build time via `app.providers`, NOT served at inference.
+# ──────────────────────────────────────────────────────────────
+synth_providers:
+  ollama_cloud:
+    description: "Ollama Cloud — paid hosted service, OpenAI-compatible API"
+    auth: "OLLAMA_API_KEY (from ollama.com)"
+    base_url: "https://ollama.com"
+    recommended_models:
+      - id: "nemotron"
+        description: "Llama-3.1-Nemotron-70B-Instruct — SOTA for synth, recommended default"
+        use_case: "SFT Q/A pair generation, DPO chosen/rejected pairs, LLM-as-judge"
+      - id: "llama3.3"
+        description: "Llama 3.3 70B — strong general-purpose instruction follower"
+        use_case: "Bulk Q/A synth when Nemotron is rate-limited"
+      - id: "qwen2.5:72b"
+        description: "Qwen 2.5 72B — very strong multilingual and reasoning"
+        use_case: "Non-English datasets, math-heavy domains"
+      - id: "deepseek-v2.5"
+        description: "DeepSeek V2.5 — strong on code and technical content"
+        use_case: "Code / technical documentation synthesis"
+      - id: "mixtral:8x22b"
+        description: "Mixtral 8x22B MoE — good cost/quality for bulk generation"
+        use_case: "High-volume low-stakes synth runs"
+
+  ollama_local:
+    description: "Local Ollama daemon — free, runs on your own hardware"
+    auth: "none (dummy token accepted)"
+    base_url: "http://localhost:11434"
+    recommended_models:
+      - id: "llama3.1"
+        description: "Llama 3.1 8B — runs on most GPUs and M-series laptops"
+      - id: "qwen2.5:7b"
+        description: "Qwen 2.5 7B — good synth quality for small datasets"
+      - id: "mistral-small"
+        description: "Mistral Small 22B — stronger than 7B, needs ~14 GB VRAM"
+
+  openai:
+    description: "OpenAI direct API"
+    auth: "OPENAI_API_KEY"
+    base_url: "https://api.openai.com"
+    recommended_models:
+      - id: "gpt-4o-mini"
+        description: "Cheap tier for high-volume synth"
+      - id: "gpt-4o"
+        description: "Higher quality for critical datasets"
+
+  openrouter:
+    description: "OpenRouter — one key, many models"
+    auth: "OPENROUTER_API_KEY"
+    base_url: "https://openrouter.ai/api"
+    recommended_models:
+      - id: "meta-llama/llama-3.1-70b-instruct"
+      - id: "anthropic/claude-3.5-sonnet"
+      - id: "nvidia/llama-3.1-nemotron-70b-instruct"
