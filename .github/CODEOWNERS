@@ -1,0 +1,31 @@
+# ────────────────────────────────────────────────────────────────
+# ValonyLabs Studio — CODEOWNERS
+# ────────────────────────────────────────────────────────────────
+# Every file in this repo is owned by the handle below, so every PR
+# automatically requests review from them. Update the handle if your
+# GitHub username is different from the guess (or switch to a team
+# slug like @valonys/maintainers once you have a team).
+#
+# Syntax reference: https://docs.github.com/en/repositories/managing-your-repositories-settings-and-security/customizing-your-repository/about-code-owners
+# ────────────────────────────────────────────────────────────────
+
+# Default — owns everything
+*                               @ataliba-miguel
+
+# Infra / CI / release-sensitive paths — keep owner explicit even
+# though the * rule above already covers them, so future changes stay
+# transparent when more maintainers are added.
+/.github/                       @ataliba-miguel
+/scripts/                       @ataliba-miguel
+/pyproject.toml                 @ataliba-miguel
+/requirements-*.txt             @ataliba-miguel
+
+# Training / inference engines — core platform code
+/app/trainers/                  @ataliba-miguel
+/app/inference/                 @ataliba-miguel
+/app/templates/                 @ataliba-miguel
+/app/hardware/                  @ataliba-miguel
+/app/data_forge/                @ataliba-miguel
+
+# Domain configs (user-defined per engagement)
+/configs/                       @ataliba-miguel
