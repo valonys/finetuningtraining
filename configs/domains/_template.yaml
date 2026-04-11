@@ -1,0 +1,122 @@
+# ──────────────────────────────────────────────────────────────
+# ValonyLabs Studio — Domain Config Blueprint
+# ──────────────────────────────────────────────────────────────
+#
+# This is a template, NOT a default. Copy it (or use one of the helpers below)
+# to create your own domain config, then run the trainer against it.
+#
+# A "domain" is anything you want the model to be: asset_integrity,
+# customer_grasps, ai_llm, legal_nda_review, medical_intake, recipes — whatever
+# the engagement requires. Each domain produces its own LoRA adapter under
+# outputs/<domain_name>/, so you can train, swap, and serve many of them side
+# by side on the same base model.
+#
+# ── Creating a domain ─────────────────────────────────────────
+#
+# 1) CLI
+#    python scripts/new_domain.py create ai_llm \
+#        --system "You are an expert LLM engineer..." \
+#        --rule "Always cite primary sources" \
+#        --rule "Prefer reproducible benchmarks"
+#
+# 2) Python
+#    from app.config_loader import create_domain_config
+#    create_domain_config(
+#        name="customer_grasps",
+#        system_prompt="You are a senior customer success manager...",
+#        constitution=["Be empathetic", "Always offer next steps"],
+#    )
+#
+# 3) REST
+#    POST /v1/domains/configs
+#    {
+#      "name": "legal_nda_review",
+#      "system_prompt": "You are a contracts attorney...",
+#      "constitution": ["Flag jurisdiction clauses", "Never give legal advice"]
+#    }
+#
+# 4) Gradio Studio → "🏷️ Domains" tab → "Create new domain"
+#
+# 5) Copy from an example
+#    python scripts/new_domain.py create my_domain --copy-from asset_integrity
+#
+# You can also seed from any existing example in configs/domains/examples/.
+# ──────────────────────────────────────────────────────────────
+
+# ═════════════════════════════ REQUIRED ═══════════════════════
+# The domain name. Must match the filename (without .yaml) and must be a
+# valid identifier: lowercase letters, digits, underscore. This is used as
+# the output folder name (outputs/<domain_name>/) and as the "adapter key"
+# the inference engine uses at serve time.
+domain_name: "your_domain_name_here"
+
+# The system prompt injected at training time AND at inference time (when
+# /v1/chat is called with domain_config_name set to this domain). This is
+# the single most important knob for shaping the model's persona.
+system_prompt: >
+  You are an expert in <your domain>. Replace this with a description of the
+  persona you want the model to adopt. Be specific — describe the role,
+  the audience, the tone, and any relevant standards or vocabulary.
+
+# ═════════════════════════════ OPTIONAL ═══════════════════════
+# Domain-specific guardrails / principles. Each rule is short, actionable,
+# and injected after the system prompt. Use this to bake in non-negotiables
+# (safety, compliance, escalation paths) without relying on hope.
+constitution: []
+  # - "Always cite the relevant standard or policy reference."
+  # - "Never speculate without noting uncertainty."
+  # - "For critical findings, recommend escalation to a human expert."
+
+# ─── SFT (supervised fine-tuning) hyperparameters ─────────────
+# Used by AgnosticSFTTrainer. Any value omitted falls back to the
+# hardware-tier default from app/hardware/profiles.py.
+training_args:
+  lora_r: 16
+  lora_alpha: 32
+  learning_rate: 2.0e-4
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  num_train_epochs: 1
+  max_steps: -1
+  max_seq_length: 2048
+
+# ─── DPO (direct preference optimization) hyperparameters ─────
+# Used by AgnosticDPOTrainer. Beta is the most sensitive knob.
+dpo_args:
+  learning_rate: 5.0e-5
+  beta: 0.1
+  num_train_epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  max_length: 2048
+
+# ─── ORPO (odds-ratio preference optimization) ────────────────
+orpo_args:
+  learning_rate: 8.0e-6
+  beta: 0.1
+  num_train_epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  max_length: 2048
+
+# ─── KTO (Kahneman-Tversky optimization) ──────────────────────
+kto_args:
+  learning_rate: 5.0e-6
+  beta: 0.1
+  desirable_weight: 1.0
+  undesirable_weight: 1.0
+  num_train_epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 8
+
+# ─── GRPO (group relative policy optimization, RL) ────────────
+# Used by AgnosticGRPOTrainer. Best for verifiable reward tasks
+# (math, code, structured outputs).
+grpo_args:
+  num_generations: 8
+  temperature: 0.8
+  max_new_tokens: 400
+  learning_rate: 5.0e-6
+  num_train_epochs: 2
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16

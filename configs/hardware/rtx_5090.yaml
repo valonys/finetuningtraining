@@ -1,0 +1,24 @@
+tier: cuda_consumer
+device: "NVIDIA RTX 5090"
+vram_gb: 32
+compute_capability: [12, 0]          # Blackwell consumer — adjust if differs
+training_backend: unsloth
+inference_backend: vllm
+torch_dtype: bfloat16
+load_in_4bit: false
+lora_r: 32
+lora_alpha: 64
+max_seq_length: 8192
+batch_size: 4
+gradient_accumulation_steps: 2
+gradient_checkpointing: true
+use_flash_attn: true
+inference_dtype: fp8
+kv_cache_dtype: fp8
+default_ocr: paddleocr
+ttft_target_ms: 25
+notes: |
+  With FP8 KV cache + RadixAttention + FlashAttention-3, expect 20-30 ms
+  TTFT on 7B FP8. Enable `enable_prefix_caching=True` (default) to reuse
+  system/rag prefixes across turns. For 13B+, drop batch_size to 2 and
+  enable speculative decoding.

@@ -1,0 +1,22 @@
+tier: cuda_legacy
+device: "Tesla T4"
+vram_gb: 16
+compute_capability: [7, 5]
+training_backend: trl          # Unsloth skips Turing; use bnb+PEFT
+inference_backend: hf          # vLLM needs Ampere+
+torch_dtype: float16
+load_in_4bit: true
+lora_r: 8
+lora_alpha: 16
+max_seq_length: 1024
+batch_size: 1
+gradient_accumulation_steps: 4
+gradient_checkpointing: true
+use_flash_attn: false
+inference_dtype: int4
+kv_cache_dtype: auto
+default_ocr: rapidocr
+ttft_target_ms: 100
+notes: |
+  T4 is a Turing GPU — no bf16, no FlashAttention 2/3, no vLLM. Stick to
+  7B models at 4-bit, sequences ≤1024 tokens. Expect 80-120 ms TTFT.

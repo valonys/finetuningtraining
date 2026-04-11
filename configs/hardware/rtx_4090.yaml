@@ -1,0 +1,19 @@
+tier: cuda_consumer
+device: "NVIDIA RTX 4090"
+vram_gb: 24
+compute_capability: [8, 9]
+training_backend: unsloth
+inference_backend: vllm
+torch_dtype: bfloat16
+load_in_4bit: true
+lora_r: 16
+lora_alpha: 32
+max_seq_length: 4096
+batch_size: 2
+gradient_accumulation_steps: 4
+gradient_checkpointing: true
+use_flash_attn: true
+inference_dtype: float16
+kv_cache_dtype: auto
+default_ocr: paddleocr
+ttft_target_ms: 30

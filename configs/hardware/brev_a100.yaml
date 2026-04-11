@@ -1,0 +1,23 @@
+tier: cuda_datacenter
+device: "NVIDIA A100"
+vram_gb: 80
+compute_capability: [8, 0]
+training_backend: unsloth
+inference_backend: vllm
+torch_dtype: bfloat16
+load_in_4bit: false
+lora_r: 32
+lora_alpha: 64
+max_seq_length: 8192
+batch_size: 4
+gradient_accumulation_steps: 2
+gradient_checkpointing: true
+use_flash_attn: true
+inference_dtype: bfloat16
+kv_cache_dtype: auto
+default_ocr: docling
+ttft_target_ms: 20
+notes: |
+  A100 80GB can serve 70B models at int8. For maximum throughput, increase
+  `gpu_memory_utilization` to 0.9 in vLLM, enable chunked prefill, and
+  consider TP=2 if you launch across two A100s.

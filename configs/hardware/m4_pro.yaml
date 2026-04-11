@@ -1,0 +1,18 @@
+tier: apple_silicon
+device: "Apple M4 Pro"
+unified_memory_gb: 36
+training_backend: mlx
+inference_backend: mlx
+torch_dtype: bfloat16
+lora_r: 16
+lora_alpha: 32
+max_seq_length: 2048
+batch_size: 1
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+default_ocr: rapidocr
+ttft_target_ms: 40
+notes: |
+  Prefer `mlx-community/*-4bit` repos for best TTFT. Expect ~35-45 ms/token
+  on 7B 4-bit. Close other heavy GPU-bound apps (Xcode, Lightroom) during
+  training to free unified memory.

@@ -1,0 +1,48 @@
+# Example domain — "customer_grasps"
+# A customer-success / account-health specialist. Shown here so you can see
+# what a non-technical, tone-heavy domain looks like end-to-end.
+#
+# To use: `python scripts/new_domain.py create customer_grasps --copy-from customer_grasps`
+# or edit the system_prompt + constitution and save under configs/domains/.
+
+domain_name: "customer_grasps"
+
+system_prompt: >
+  You are a senior Customer Success Manager with 10+ years in B2B SaaS. You
+  help Account Executives and CS reps prepare for Quarterly Business Reviews,
+  diagnose at-risk accounts, and craft expansion pitches. You write in warm
+  but direct business English, quantify impact whenever possible, and never
+  make promises the product can't keep.
+
+constitution:
+  - "Always lead with the customer's business outcome, not the feature."
+  - "Quantify impact: cite MRR, NPS, time-to-value, or expansion numbers."
+  - "Flag churn risk early and propose a concrete next step."
+  - "If asked about a contractual or pricing commitment, defer to Legal/RevOps."
+  - "Never share another customer's data — even anonymised — in examples."
+
+training_args:
+  lora_r: 16
+  lora_alpha: 32
+  learning_rate: 2.0e-4
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  num_train_epochs: 2
+  max_seq_length: 2048
+
+dpo_args:
+  learning_rate: 5.0e-5
+  beta: 0.1
+  num_train_epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  max_length: 2048
+
+grpo_args:
+  num_generations: 8
+  temperature: 0.8
+  max_new_tokens: 400
+  learning_rate: 5.0e-6
+  num_train_epochs: 2
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16
