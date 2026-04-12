@@ -3,14 +3,13 @@ import Health from "./components/Health";
 import Domains from "./components/Domains";
 import DataForge from "./components/DataForge";
 import Train from "./components/Train";
-import Chat from "./components/Chat";
+import ChatWidget from "./components/ChatWidget";
 
 const TABS = [
-  { id: "health",    label: "Health",     icon: "+" },
-  { id: "domains",   label: "Domains",    icon: "#" },
-  { id: "dataforge", label: "Data Forge", icon: ">" },
-  { id: "train",     label: "Train",      icon: "^" },
-  { id: "chat",      label: "Chat",       icon: "@" },
+  { id: "health",    label: "Health" },
+  { id: "domains",   label: "Domains" },
+  { id: "dataforge", label: "Data Forge" },
+  { id: "train",     label: "Train" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -43,7 +42,7 @@ export default function App() {
             onClick={() => setTab(t.id)}
             className={`px-4 py-2 text-sm font-medium rounded-t transition-colors ${
               tab === t.id
-                ? "bg-brand-50 text-brand-700 border-b-2 border-brand-600"
+                ? "bg-blue-50 text-blue-700 border-b-2 border-blue-600"
                 : "text-gray-500 hover:text-gray-800 hover:bg-gray-50"
             }`}
           >
@@ -58,13 +57,15 @@ export default function App() {
         {tab === "domains"   && <Domains />}
         {tab === "dataforge" && <DataForge />}
         {tab === "train"     && <Train />}
-        {tab === "chat"      && <Chat />}
       </main>
 
       {/* ── Footer ──────────────────────────────────────── */}
       <footer className="text-center text-xs text-gray-400 py-4 border-t">
         ValonyLabs Studio v3.0 &mdash; React + TypeScript + FastAPI
       </footer>
+
+      {/* ── Floating chat widget (always visible, all tabs) */}
+      <ChatWidget />
     </div>
   );
 }
