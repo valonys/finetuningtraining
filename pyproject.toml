@@ -23,7 +23,7 @@ dependencies = [
     "sentencepiece>=0.2",
     "tiktoken>=0.7",
     "safetensors>=0.4",
-    "gradio>=4.44",
+    # Frontend is React/TS (see frontend/). No Python UI deps.
     # Data Forge core
     "pymupdf>=1.24",
     "pdfplumber>=0.11",

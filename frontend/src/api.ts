@@ -1,0 +1,96 @@
+/**
+ * REST client for the ValonyLabs Studio FastAPI backend.
+ *
+ * In dev mode, Vite proxies /healthz and /v1/* to localhost:8000 — see
+ * vite.config.ts. In production, the frontend is served by the same
+ * FastAPI process (or by any static host) so requests go to the same
+ * origin.
+ */
+import type {
+  ChatRequest,
+  ChatResponse,
+  DomainConfigCreate,
+  DomainConfigInfo,
+  DomainConfigList,
+  ForgeBuildResponse,
+  HealthResponse,
+  JobStatus,
+  TrainingJobRequest,
+} from "./types";
+
+const BASE = import.meta.env.VITE_API_URL ?? "";
+
+async function call<T>(
+  path: string,
+  opts?: RequestInit
+): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    headers: { "Content-Type": "application/json", ...(opts?.headers as Record<string, string>) },
+    ...opts,
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    let detail: string;
+    try {
+      detail = JSON.parse(body).detail ?? body;
+    } catch {
+      detail = body;
+    }
+    throw new Error(`${res.status} ${res.statusText}: ${detail}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+// ── Health ────────────────────────────────────────────────────
+export const getHealth = () => call<HealthResponse>("/healthz");
+
+// ── Templates & OCR ──────────────────────────────────────────
+export const getTemplates = () => call<{ templates: string[] }>("/v1/templates");
+export const getOCREngines = () => call<{ engines: string[] }>("/v1/ocr/engines");
+
+// ── Domain configs ───────────────────────────────────────────
+export const listDomainConfigs = () => call<DomainConfigList>("/v1/domains/configs");
+export const getDomainConfig = (name: string) =>
+  call<DomainConfigInfo>(`/v1/domains/configs/${encodeURIComponent(name)}`);
+export const createDomainConfig = (body: DomainConfigCreate) =>
+  call<DomainConfigInfo>("/v1/domains/configs", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+export const getDomainTemplate = () => call<{ template: Record<string, unknown> }>("/v1/domains/template");
+
+// ── Data Forge ───────────────────────────────────────────────
+export const forgeBuildDataset = (body: {
+  paths: string[];
+  task: string;
+  base_model: string;
+  system_prompt: string;
+  synth_qa: boolean;
+  target_size: number | null;
+}) =>
+  call<ForgeBuildResponse>("/v1/forge/build_dataset", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+// ── Training jobs ────────────────────────────────────────────
+export const createTrainingJob = (body: TrainingJobRequest) =>
+  call<JobStatus>("/v1/jobs/create", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+export const getJob = (jobId: string) => call<JobStatus>(`/v1/jobs/${jobId}`);
+export const listJobs = () => call<JobStatus[]>("/v1/jobs");
+
+// ── Trained adapters ─────────────────────────────────────────
+export const listTrainedDomains = () =>
+  call<{ domain_name: string; adapter_path: string }[]>("/v1/domains");
+export const reloadInference = () =>
+  call<{ status: string; domains: string[] }>("/v1/inference/reload", { method: "POST" });
+
+// ── Chat / inference ─────────────────────────────────────────
+export const chat = (body: ChatRequest) =>
+  call<ChatResponse>("/v1/chat", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
