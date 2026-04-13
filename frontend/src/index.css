@@ -4,7 +4,17 @@
 
 body {
   margin: 0;
-  font-family: Inter, system-ui, -apple-system, sans-serif;
+  /* Tw Cen MT is a proprietary Monotype/Microsoft font that ships with
+     Microsoft Office (and so is available natively on most Windows and
+     Office-on-Mac installations). The fallback chain keeps the geometric
+     humanist look everywhere else:
+       Century Gothic — similar proprietary geometric, often present
+       Jost          — Google Fonts, open-source Futura/Tw-Cen-MT-adjacent
+       Futura, Avenir Next, Avenir — common macOS geometric sans
+       system-ui / sans-serif — platform default                         */
+  font-family: "Tw Cen MT", "Century Gothic", "Jost", "Futura",
+               "Avenir Next", "Avenir", system-ui, -apple-system, sans-serif;
+  font-feature-settings: "kern", "liga", "calt";
 }
 
 @layer components {

@@ -3,6 +3,22 @@ export default {
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
+      fontFamily: {
+        // Override Tailwind's default `font-sans` stack so every class
+        // (including <body> inheritance and explicit font-sans) picks up
+        // Tw Cen MT when available.
+        sans: [
+          '"Tw Cen MT"',
+          '"Century Gothic"',
+          '"Jost"',
+          '"Futura"',
+          '"Avenir Next"',
+          '"Avenir"',
+          "system-ui",
+          "-apple-system",
+          "sans-serif",
+        ],
+      },
       colors: {
         brand: {
           50: "#eff6ff",
