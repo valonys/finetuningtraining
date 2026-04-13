@@ -230,6 +230,21 @@ def get_inference_engine(base_model: str, *, backend: Optional[str] = None) -> I
     return _engine
 
 
+def is_engine_loaded() -> bool:
+    """True iff the singleton has been initialised (without forcing init).
+
+    Used by /healthz and other read-only endpoints so they can report the
+    engine state cheaply, without paying the cost of a 14 GB model
+    download just to render a status card.
+    """
+    return _engine is not None
+
+
+def get_loaded_engine() -> Optional["InferenceManager"]:
+    """Return the singleton if loaded, else None. Never triggers init."""
+    return _engine
+
+
 def reset_engine() -> None:
     global _engine
     _engine = None

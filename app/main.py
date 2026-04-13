@@ -58,6 +58,8 @@ from app.hardware import detect_hardware, resolve_profile
 from app.inference.manager import (
     GenerationRequest,
     get_inference_engine,
+    get_loaded_engine,
+    is_engine_loaded,
     reset_engine,
 )
 from app.providers import describe_active_provider
@@ -105,24 +107,48 @@ DEFAULT_BASE_MODEL = os.environ.get("VALONY_BASE_MODEL", "Qwen/Qwen2.5-7B-Instru
 # through a local Ollama daemon or Ollama Cloud. Leave unset to let the
 # hardware profile pick (vLLM on CUDA, MLX on Apple, etc.).
 DEFAULT_INFERENCE_BACKEND = os.environ.get("VALONY_INFERENCE_BACKEND") or None
+# Pre-warming the inference engine downloads the base model into the HF
+# cache (~14 GB for a 7B). On a fresh machine that blocks startup for
+# minutes — uvicorn won't accept any requests until the lifespan
+# completes. So pre-warm is OPT-IN: set VALONY_PREWARM_INFERENCE=1 to
+# enable it. Default is lazy — the first /v1/chat call triggers the
+# load, and meanwhile every other endpoint (Health, Domains, Data
+# Forge, Train) responds instantly.
+PREWARM_INFERENCE = os.environ.get("VALONY_PREWARM_INFERENCE", "").lower() in (
+    "1", "true", "yes", "on"
+)
 
 
 # ──────────────────────────────────────────────────────────────
-# Lifespan — pre-warm the inference engine on startup
+# Lifespan — fast startup, lazy inference engine
 # ──────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 ValonyLabs Studio v3.0 starting")
-    hw = detect_hardware()
-    prof = resolve_profile(hw)
-    logger.info(f"   Hardware: {hw.tier} | {hw.device_name} | mem={hw.effective_memory_gb} GB")
-    logger.info(f"   Training backend: {prof.training_backend}")
-    logger.info(f"   Inference backend: {DEFAULT_INFERENCE_BACKEND or prof.inference_backend}")
     try:
-        engine = get_inference_engine(DEFAULT_BASE_MODEL, backend=DEFAULT_INFERENCE_BACKEND)
-        logger.info(f"   ✅ Inference engine: {engine.backend}")
+        hw = detect_hardware()
+        prof = resolve_profile(hw)
+        logger.info(f"   Hardware: {hw.tier} | {hw.device_name} | mem={hw.effective_memory_gb} GB")
+        logger.info(f"   Training backend: {prof.training_backend}")
+        logger.info(f"   Inference backend: {DEFAULT_INFERENCE_BACKEND or prof.inference_backend}")
     except Exception as e:
-        logger.warning(f"   ⚠️  Inference pre-warm skipped: {e}")
+        logger.warning(f"   ⚠️  Hardware detection failed at startup: {e}")
+
+    if PREWARM_INFERENCE:
+        # Eager load — useful in production where you want a deterministic
+        # first-request latency, but blocks startup until the model is
+        # downloaded (potentially many GB).
+        logger.info(f"   Pre-warming inference engine with {DEFAULT_BASE_MODEL} ...")
+        try:
+            engine = get_inference_engine(DEFAULT_BASE_MODEL, backend=DEFAULT_INFERENCE_BACKEND)
+            logger.info(f"   ✅ Inference engine: {engine.backend}")
+        except Exception as e:
+            logger.warning(f"   ⚠️  Inference pre-warm failed: {e}")
+    else:
+        logger.info(
+            "   Inference engine: lazy (will load on first /v1/chat call). "
+            "Set VALONY_PREWARM_INFERENCE=1 to load eagerly at startup."
+        )
     yield
     logger.info("ValonyLabs Studio shutting down")
 
@@ -175,15 +201,20 @@ async def health():
         logger.warning(f"healthz: resolve_profile failed: {e}")
         profile_dict = {"error": str(e)}
 
-    # Inference engine (may be not-yet-initialised or missing deps)
+    # Inference engine — read state ONLY if already loaded. Never force a
+    # cold-init here: that would download multi-GB model weights on the
+    # very first /healthz call and block every other request until done.
     try:
-        engine = get_inference_engine(DEFAULT_BASE_MODEL, backend=DEFAULT_INFERENCE_BACKEND)
-        domains = engine.registered_domains
-        backend = engine.backend
-        stats = engine.latency_stats()
+        engine = get_loaded_engine()
+        if engine is not None:
+            domains = engine.registered_domains
+            backend = engine.backend
+            stats = engine.latency_stats()
+        else:
+            domains, backend, stats = [], "lazy_not_loaded", {}
     except Exception as e:
-        logger.warning(f"healthz: inference engine not ready: {e}")
-        domains, backend, stats = [], "not_loaded", {}
+        logger.warning(f"healthz: inference engine state read failed: {e}")
+        domains, backend, stats = [], "error", {}
 
     # OCR engines — wrapped because rapidocr_engine imports numpy at module level
     try:
@@ -504,7 +535,16 @@ async def list_jobs():
 # ──────────────────────────────────────────────────────────────
 @app.get("/v1/domains", response_model=List[DomainInfo])
 async def list_domains():
-    engine = get_inference_engine(DEFAULT_BASE_MODEL, backend=DEFAULT_INFERENCE_BACKEND)
+    """List trained adapters that are registered with the inference engine.
+
+    Same lazy pattern as /healthz — if the engine isn't loaded yet, return
+    an empty list rather than triggering a multi-GB model download just to
+    enumerate the (empty) adapter registry. Once the engine is loaded
+    (e.g. after the first /v1/chat call), this returns the real list.
+    """
+    engine = get_loaded_engine()
+    if engine is None:
+        return []
     return [
         DomainInfo(domain_name=name, adapter_path=path)
         for name, path in engine.lora_registry.items()
