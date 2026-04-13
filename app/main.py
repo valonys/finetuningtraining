@@ -131,33 +131,76 @@ app.add_middleware(
 # ──────────────────────────────────────────────────────────────
 @app.get("/healthz", response_model=HealthResponse)
 async def health():
-    hw = detect_hardware()
-    prof = resolve_profile(hw)
+    """
+    Resilient health check — every subsystem is fetched in its own
+    try/except block so that a missing optional dep (numpy, torch,
+    transformers, ...) can't take the whole endpoint down. Any failed
+    section is logged and replaced with a safe default. The endpoint
+    itself should never return 500.
+    """
+    # Hardware detection + profile resolution
     try:
-        engine = get_inference_engine(DEFAULT_BASE_MODEL, backend=DEFAULT_INFERENCE_BACKEND)
-        domains = engine.registered_domains
-        backend = engine.backend
-        stats = engine.latency_stats()
-    except Exception:
-        domains, backend, stats = [], "not_loaded", {}
+        hw = detect_hardware()
+        hardware_dict = hw.as_dict()
+    except Exception as e:
+        logger.warning(f"healthz: detect_hardware failed: {e}")
+        hardware_dict = {"tier": "unknown", "error": str(e)}
 
-    return HealthResponse(
-        status="ok",
-        version=__version__,
-        hardware=hw.as_dict(),
-        profile={
+    try:
+        prof = resolve_profile()
+        profile_dict = {
             "training_backend": prof.training_backend,
             "inference_backend": prof.inference_backend,
             "torch_dtype": prof.torch_dtype,
             "max_seq_length": prof.max_seq_length,
             "lora_r": prof.lora_r,
-        },
+        }
+    except Exception as e:
+        logger.warning(f"healthz: resolve_profile failed: {e}")
+        profile_dict = {"error": str(e)}
+
+    # Inference engine (may be not-yet-initialised or missing deps)
+    try:
+        engine = get_inference_engine(DEFAULT_BASE_MODEL, backend=DEFAULT_INFERENCE_BACKEND)
+        domains = engine.registered_domains
+        backend = engine.backend
+        stats = engine.latency_stats()
+    except Exception as e:
+        logger.warning(f"healthz: inference engine not ready: {e}")
+        domains, backend, stats = [], "not_loaded", {}
+
+    # OCR engines — wrapped because rapidocr_engine imports numpy at module level
+    try:
+        available_ocr = list_available_engines()
+    except Exception as e:
+        logger.warning(f"healthz: list_available_engines failed: {e}")
+        available_ocr = []
+
+    # Chat templates
+    try:
+        available_templates = list_templates()
+    except Exception as e:
+        logger.warning(f"healthz: list_templates failed: {e}")
+        available_templates = []
+
+    # Synth provider descriptor
+    try:
+        synth_provider = describe_active_provider()
+    except Exception as e:
+        logger.warning(f"healthz: describe_active_provider failed: {e}")
+        synth_provider = {"provider": "unknown", "error": str(e)}
+
+    return HealthResponse(
+        status="ok",
+        version=__version__,
+        hardware=hardware_dict,
+        profile=profile_dict,
         registered_domains=domains,
         inference_backend=backend,
         latency_stats=stats,
-        available_ocr=list_available_engines(),
-        available_templates=list_templates(),
-        synth_provider=describe_active_provider(),
+        available_ocr=available_ocr,
+        available_templates=available_templates,
+        synth_provider=synth_provider,
     )
 
 
