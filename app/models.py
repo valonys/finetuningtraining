@@ -63,6 +63,26 @@ class ForgeIngestRequest(BaseModel):
     )
 
 
+class UploadedFileInfo(BaseModel):
+    name: str
+    path: str
+    size: int
+
+
+class UploadListResponse(BaseModel):
+    files: List[UploadedFileInfo]
+    total_bytes: int
+
+
+class UploadResponse(BaseModel):
+    uploaded: List[UploadedFileInfo]
+    skipped: List[Dict[str, str]] = Field(
+        default_factory=list,
+        description="Files rejected (e.g. too large, empty). Each entry has "
+                    "`name` and `reason`.",
+    )
+
+
 class ForgeBuildRequest(BaseModel):
     paths: List[str]
     task: Literal["sft", "dpo", "orpo", "kto", "grpo"] = "sft"

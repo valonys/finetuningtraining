@@ -47,6 +47,22 @@ export interface ForgeBuildRequest {
   output_dir?: string;
 }
 
+export interface UploadedFileInfo {
+  name: string;
+  path: string;
+  size: number;
+}
+
+export interface UploadResponse {
+  uploaded: UploadedFileInfo[];
+  skipped: { name: string; reason: string }[];
+}
+
+export interface UploadListResponse {
+  files: UploadedFileInfo[];
+  total_bytes: number;
+}
+
 export interface ForgeBuildResponse {
   output_path: string;
   task: string;

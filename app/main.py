@@ -9,6 +9,11 @@ Endpoints
   GET  /v1/templates                     List registered chat templates
   GET  /v1/ocr/engines                   List available OCR engines
 
+  POST /v1/forge/upload                  Upload one or more files (multipart)
+  GET  /v1/forge/uploads                 List currently-uploaded files
+  DELETE /v1/forge/uploads               Clear every uploaded file
+  DELETE /v1/forge/uploads/{filename}    Delete one uploaded file
+
   POST /v1/forge/ingest                  Ingest files → list of records
   POST /v1/forge/build_dataset           Ingest → normalise → HF dataset
 
@@ -35,7 +40,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
@@ -69,6 +74,17 @@ from app.models import (
     HealthResponse,
     JobStatus,
     TrainingJobRequest,
+    UploadListResponse,
+    UploadResponse,
+    UploadedFileInfo,
+)
+from app.uploads import (
+    UploadError,
+    clear_uploads,
+    delete_upload,
+    list_uploads,
+    save_upload,
+    total_upload_bytes,
 )
 from app.templates import list_templates
 from app.trainers import (
@@ -278,7 +294,61 @@ async def domain_configs_template():
 
 
 # ──────────────────────────────────────────────────────────────
-# Data Forge
+# Data Forge — uploads
+# ──────────────────────────────────────────────────────────────
+@app.post("/v1/forge/upload", response_model=UploadResponse)
+async def forge_upload(files: List[UploadFile] = File(...)):
+    """
+    Stream one or more files to `./data/uploads/`. The frontend passes
+    the returned paths to `/v1/forge/build_dataset`. Rejected files (empty,
+    oversize) are listed in `skipped` with a human-readable reason so the
+    UI can show per-file feedback without failing the whole batch.
+    """
+    uploaded: List[UploadedFileInfo] = []
+    skipped: List[Dict[str, str]] = []
+    for f in files:
+        try:
+            rec = await save_upload(f)
+            uploaded.append(
+                UploadedFileInfo(name=rec.name, path=rec.path, size=rec.size)
+            )
+        except UploadError as e:
+            skipped.append({"name": f.filename or "(unnamed)", "reason": str(e)})
+        except Exception as e:
+            logger.exception(f"upload failed for {f.filename}")
+            skipped.append({"name": f.filename or "(unnamed)", "reason": str(e)})
+    return UploadResponse(uploaded=uploaded, skipped=skipped)
+
+
+@app.get("/v1/forge/uploads", response_model=UploadListResponse)
+async def forge_list_uploads():
+    files = list_uploads()
+    return UploadListResponse(
+        files=[UploadedFileInfo(name=f.name, path=f.path, size=f.size) for f in files],
+        total_bytes=total_upload_bytes(),
+    )
+
+
+@app.delete("/v1/forge/uploads")
+async def forge_clear_uploads():
+    """Delete every file in the uploads directory."""
+    count = clear_uploads()
+    return {"deleted": count}
+
+
+@app.delete("/v1/forge/uploads/{filename}")
+async def forge_delete_upload(filename: str):
+    try:
+        ok = delete_upload(filename)
+    except UploadError as e:
+        raise HTTPException(400, str(e))
+    if not ok:
+        raise HTTPException(404, f"No uploaded file named '{filename}'")
+    return {"deleted": filename}
+
+
+# ──────────────────────────────────────────────────────────────
+# Data Forge — ingest / build
 # ──────────────────────────────────────────────────────────────
 @app.post("/v1/forge/ingest")
 async def forge_ingest(req: ForgeIngestRequest):

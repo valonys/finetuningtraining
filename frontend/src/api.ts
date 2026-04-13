@@ -16,6 +16,8 @@ import type {
   HealthResponse,
   JobStatus,
   TrainingJobRequest,
+  UploadListResponse,
+  UploadResponse,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_URL ?? "";
@@ -72,6 +74,51 @@ export const forgeBuildDataset = (body: {
     method: "POST",
     body: JSON.stringify(body),
   });
+
+/**
+ * Upload one or more files via multipart/form-data. Do NOT set a
+ * Content-Type header — the browser sets it automatically with the
+ * correct multipart boundary. Uses XHR (not fetch) so we can surface
+ * upload progress, which matters for big PDFs and image batches.
+ */
+export function forgeUpload(
+  files: File[],
+  onProgress?: (loaded: number, total: number) => void
+): Promise<UploadResponse> {
+  const form = new FormData();
+  for (const f of files) form.append("files", f, f.name);
+
+  return new Promise<UploadResponse>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${BASE}/v1/forge/upload`);
+    xhr.upload.onprogress = (e) => {
+      if (onProgress && e.lengthComputable) onProgress(e.loaded, e.total);
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try { resolve(JSON.parse(xhr.responseText) as UploadResponse); }
+        catch (e) { reject(new Error(`Invalid response: ${e}`)); }
+      } else {
+        let detail = xhr.responseText;
+        try { detail = JSON.parse(xhr.responseText).detail ?? detail; } catch { /* keep raw */ }
+        reject(new Error(`${xhr.status} ${xhr.statusText}: ${detail}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error("Upload failed (network error)"));
+    xhr.send(form);
+  });
+}
+
+export const forgeListUploads = () => call<UploadListResponse>("/v1/forge/uploads");
+
+export const forgeDeleteUpload = (filename: string) =>
+  call<{ deleted: string }>(
+    `/v1/forge/uploads/${encodeURIComponent(filename)}`,
+    { method: "DELETE" }
+  );
+
+export const forgeClearUploads = () =>
+  call<{ deleted: number }>("/v1/forge/uploads", { method: "DELETE" });
 
 // ── Training jobs ────────────────────────────────────────────
 export const createTrainingJob = (body: TrainingJobRequest) =>
