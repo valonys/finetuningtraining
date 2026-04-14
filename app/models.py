@@ -63,6 +63,26 @@ class ForgeIngestRequest(BaseModel):
     )
 
 
+class UploadedFileInfo(BaseModel):
+    name: str
+    path: str
+    size: int
+
+
+class UploadListResponse(BaseModel):
+    files: List[UploadedFileInfo]
+    total_bytes: int
+
+
+class UploadResponse(BaseModel):
+    uploaded: List[UploadedFileInfo]
+    skipped: List[Dict[str, str]] = Field(
+        default_factory=list,
+        description="Files rejected (e.g. too large, empty). Each entry has "
+                    "`name` and `reason`.",
+    )
+
+
 class ForgeBuildRequest(BaseModel):
     paths: List[str]
     task: Literal["sft", "dpo", "orpo", "kto", "grpo"] = "sft"
@@ -75,7 +95,14 @@ class ForgeBuildRequest(BaseModel):
 
 
 class ForgeBuildResponse(BaseModel):
-    output_path: str
+    output_path: str = Field(
+        description="Path to the primary JSONL dataset (one row per line). "
+                    "Loadable via `load_dataset('json', data_files=...)`."
+    )
+    preview_path: str = Field(
+        description="Path to a pretty-printed JSON file containing the first "
+                    "~10 rows of the dataset — for peeking in any editor."
+    )
     task: str
     template: str
     num_examples: int
@@ -170,3 +197,9 @@ class HealthResponse(BaseModel):
     latency_stats: dict
     available_ocr: List[str]
     available_templates: List[str]
+    synth_provider: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Active LLM provider used by the Data Forge for Q/A and "
+                    "pair synthesis (Ollama Cloud Nemotron by default when "
+                    "OLLAMA_API_KEY is set).",
+    )

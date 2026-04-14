@@ -44,6 +44,7 @@ class DatasetBuilder:
         from datasets import Dataset
         from .chunker import chunk_records
         from .qa_synthesis import synthesize_qa
+        from .pair_synthesis import synthesize_pairs
         from app.templates import get_template_for
 
         template = get_template_for(self.base_model)
@@ -59,38 +60,35 @@ class DatasetBuilder:
             raise ValueError("Data Forge: no chunks produced — is the input empty?")
         logger.info(f"🧱 Chunked into {len(chunks)} pieces")
 
-        # Synthesise Q/A if requested
+        # Phase 1: derive base (instruction, response) seeds from chunks
         if self.synth_qa:
-            pairs = synthesize_qa(chunks, mode=self.synth_mode)
+            seeds = synthesize_qa(chunks, mode=self.synth_mode)
         else:
-            # Treat every chunk as a "summarise" task
-            pairs = [{
+            seeds = [{
                 "instruction": "Summarise the following passage.",
                 "response": c["chunk"],
                 "source": c.get("source", ""),
             } for c in chunks]
 
         if self.target_size:
-            pairs = pairs[: self.target_size]
+            seeds = seeds[: self.target_size]
 
+        # Phase 2: task-specific shaping
         if self.task == "sft":
-            rows = [self._to_sft_row(p, template) for p in pairs]
-            ds = Dataset.from_list(rows)
-        elif self.task == "dpo":
-            rows = [self._to_dpo_row(p, template) for p in pairs]
-            ds = Dataset.from_list(rows)
+            rows = [self._to_sft_row(p, template) for p in seeds]
         elif self.task == "grpo":
-            rows = [self._to_grpo_row(p, template) for p in pairs]
-            ds = Dataset.from_list(rows)
-        elif self.task == "orpo":
-            rows = [self._to_dpo_row(p, template) for p in pairs]
-            ds = Dataset.from_list(rows)
+            rows = [self._to_grpo_row(p, template) for p in seeds]
         elif self.task == "kto":
-            rows = [self._to_kto_row(p, template) for p in pairs]
-            ds = Dataset.from_list(rows)
+            rows = [self._to_kto_row(p, template) for p in seeds]
+        elif self.task in ("dpo", "orpo"):
+            # Upgrade seeds → real (chosen, rejected) pairs via the synth
+            # provider. Set OLLAMA_API_KEY for Nemotron on Ollama Cloud.
+            contrastive = synthesize_pairs(seeds)
+            rows = [self._to_preference_row(p, template) for p in contrastive]
         else:
             raise ValueError(f"Unsupported task: {self.task}")
 
+        ds = Dataset.from_list(rows)
         logger.info(f"✅ Built {self.task} dataset with {len(ds)} examples")
         return ds
 
@@ -111,20 +109,25 @@ class DatasetBuilder:
             "source": pair.get("source", ""),
         }
 
-    def _to_dpo_row(self, pair: dict, template) -> dict:
-        # For bootstrapped DPO from single-answer data, we use a placeholder
-        # "rejected" response: a truncated/stubbed version. Real DPO should
-        # come from a paired dataset or rejection sampling; this is a starter.
+    def _to_preference_row(self, pair: dict, template) -> dict:
+        """
+        Turn a contrastive pair from `pair_synthesis.synthesize_pairs` into
+        a TRL-ready preference row. The heavy lifting (generating a plausible
+        rejected response) has already happened upstream via the LLM provider
+        — this just applies the chat template for the base model.
+
+        Shared between DPO and ORPO which both consume `{prompt, chosen, rejected}`.
+        """
         prompt = template.format_prompt_only(
             system=self.system_prompt,
             instruction=pair["instruction"],
         )
-        rejected = (pair["response"][: max(20, len(pair["response"]) // 3)]).strip() + "..."
         return {
             "prompt": prompt,
-            "chosen": pair["response"],
-            "rejected": rejected,
+            "chosen": pair["chosen"],
+            "rejected": pair["rejected"],
             "source": pair.get("source", ""),
+            "synth": pair.get("synth", "unknown"),
         }
 
     def _to_grpo_row(self, pair: dict, template) -> dict:

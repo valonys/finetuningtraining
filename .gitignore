@@ -1,3 +1,9 @@
+# ── Node / React ──────────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.vite/
+.eslintcache
+
 # ── Python ────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]

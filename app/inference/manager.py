@@ -121,6 +121,64 @@ class InferenceManager:
     def generate_full(self, req: GenerationRequest) -> GenerationResponse:
         return self._backend.generate(req)
 
+    def generate_stream(self, req: GenerationRequest):
+        """
+        Incremental generation — yields text deltas as they arrive, then
+        a final dict with summary metadata (backend, model, ttft_ms,
+        latency_ms, tokens_generated, tokens_per_second).
+
+        Downstream SSE endpoint wraps each yielded item into a
+        `data: {json}\\n\\n` frame. Backends that don't support token-
+        level streaming (vLLM's simple path, mlx without `stream_generate`,
+        etc.) may fall back to a single final-delta emission — the
+        contract is preserved, just coarser.
+
+        For now the Ollama backend is the authoritative streaming path
+        (Server-Sent Events from Ollama Cloud or the local daemon). Other
+        backends raise NotImplementedError which the endpoint converts
+        to a 501 with a helpful message.
+        """
+        import time
+        if not hasattr(self._backend, "stream"):
+            raise NotImplementedError(
+                f"Backend '{self._backend_name}' does not yet support "
+                f"token streaming. Use /v1/chat for a batched response, "
+                f"or switch to the ollama backend via "
+                f"VALONY_INFERENCE_BACKEND=ollama."
+            )
+        t_start = time.perf_counter()
+        ttft_ms = 0.0
+        n_tokens = 0
+        model_used = getattr(self._backend, "model_id", self.base_model_id)
+
+        for delta in self._backend.stream(req):
+            if n_tokens == 0:
+                ttft_ms = (time.perf_counter() - t_start) * 1000
+            n_tokens += 1
+            yield delta
+
+        t_end = time.perf_counter()
+        lat_ms = (t_end - t_start) * 1000
+        tps = (n_tokens / (t_end - t_start)) if (t_end > t_start and n_tokens) else 0.0
+
+        # Record in the rolling telemetry so /healthz reflects stream stats too
+        if ttft_ms:
+            self._ttft_samples.append(ttft_ms)
+        self._lat_samples.append(lat_ms)
+        _trim(self._ttft_samples)
+        _trim(self._lat_samples)
+
+        yield {
+            "__meta__": True,
+            "backend": self._backend_name,
+            "model": model_used,
+            "domain": req.domain_name,
+            "ttft_ms": ttft_ms or (lat_ms / max(n_tokens, 1)),
+            "latency_ms": lat_ms,
+            "tokens_generated": n_tokens,
+            "tokens_per_second": tps,
+        }
+
     def register_adapter(self, domain_name: str, adapter_path: str) -> None:
         self.lora_registry[domain_name] = adapter_path
         if hasattr(self._backend, "register_adapter"):
@@ -174,11 +232,21 @@ class InferenceManager:
         if name == "hf":
             from .hf_backend import HFBackend
             return HFBackend(self.base_model_id, profile=profile, lora_registry=self.lora_registry)
+        if name == "ollama":
+            from .ollama_backend import OllamaInferenceBackend
+            return OllamaInferenceBackend(self.base_model_id, profile=profile, lora_registry=self.lora_registry)
         raise ValueError(f"Unknown backend: {name}")
 
 
 def _ordered_fallback(preferred: str, hw_tier: str) -> List[str]:
-    """Ordered list of backends to try — preferred first, then sane defaults."""
+    """
+    Ordered list of backends to try — preferred first, then sane defaults.
+
+    Ollama is never auto-appended to the fallback chain: it depends on an
+    external daemon (or a cloud API key) that we can't assume is available,
+    and its LoRA semantics differ from the other backends. Users opt in via
+    `backend="ollama"` or `VALONY_INFERENCE_BACKEND=ollama`.
+    """
     order: list[str] = [preferred]
     if hw_tier == "apple_silicon":
         extras = ["mlx", "llamacpp", "hf"]
@@ -217,6 +285,21 @@ def get_inference_engine(base_model: str, *, backend: Optional[str] = None) -> I
     global _engine
     if _engine is None or _engine.base_model_id != base_model:
         _engine = InferenceManager(base_model, backend=backend)
+    return _engine
+
+
+def is_engine_loaded() -> bool:
+    """True iff the singleton has been initialised (without forcing init).
+
+    Used by /healthz and other read-only endpoints so they can report the
+    engine state cheaply, without paying the cost of a 14 GB model
+    download just to render a status card.
+    """
+    return _engine is not None
+
+
+def get_loaded_engine() -> Optional["InferenceManager"]:
+    """Return the singleton if loaded, else None. Never triggers init."""
     return _engine
 
 

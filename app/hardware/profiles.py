@@ -30,7 +30,7 @@ class ResolvedProfile:
     gradient_checkpointing: bool
     use_flash_attn: bool
     # Inference
-    inference_backend: Literal["vllm", "sglang", "mlx", "llamacpp", "hf"]
+    inference_backend: Literal["vllm", "sglang", "mlx", "llamacpp", "hf", "ollama"]
     inference_dtype: Literal["bfloat16", "float16", "fp8", "int8", "int4"]
     kv_cache_dtype: Literal["auto", "fp16", "fp8", "int8"]
     # Data Forge

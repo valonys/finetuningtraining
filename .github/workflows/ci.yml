@@ -1,9 +1,10 @@
 name: CI
 
-# Run on every push and pull request. The only tests wired up are the
-# three no-GPU smoke tests (template routing, hardware detection,
-# data-forge chunker) — they're enough to catch import regressions and
-# chat-template routing bugs without needing a GPU runner.
+# Run on every push and pull request. Executes every no-GPU test under
+# `tests/` — the test suite includes template routing, hardware
+# detection, Data Forge chunker, provider URL/auth resolution, and the
+# DPO pair-synthesis fallback behaviour. All tests mock out network
+# and heavy deps so the runner stays slim.
 
 on:
   push:
@@ -37,21 +38,15 @@ jobs:
           cache: pip
 
       - name: Install minimal dependencies
-        # The three target tests only need pytest + pyyaml + pydantic.
-        # We do NOT install torch, transformers, trl, unsloth, mlx, vllm,
-        # bitsandbytes, etc. — the tests are designed to run without them.
+        # The test deps live in requirements-test.txt so adding a new
+        # module with a new dep never breaks CI again — update the file
+        # once, CI + local dev stay in sync.
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pyyaml "pydantic>=2.6"
+          pip install -r requirements-test.txt
 
-      - name: Run template routing tests
-        run: pytest tests/test_templates.py -v
-
-      - name: Run hardware detection tests
-        run: pytest tests/test_hardware.py -v
-
-      - name: Run Data Forge chunker tests
-        run: pytest tests/test_data_forge_chunker.py -v
+      - name: Run all no-GPU tests
+        run: pytest tests/ -v
 
       - name: Aggregate summary
         if: always()
@@ -59,4 +54,4 @@ jobs:
           echo "## Smoke test summary" >> "$GITHUB_STEP_SUMMARY"
           echo "- Python: ${{ matrix.python-version }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Runner: ubuntu-latest" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Scope: template routing, hardware detection, data-forge chunker" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Scope: tests/ (templates, hardware, chunker, providers, pair synth, uploads, RAG)" >> "$GITHUB_STEP_SUMMARY"

@@ -25,32 +25,42 @@ def _register(cls: type[OCREngine]):
     return cls
 
 
-# Lazy import + register
+# Lazy import + register. EVERY engine import is guarded — a missing
+# top-level dep (e.g. numpy for rapidocr, pytesseract for tesseract)
+# must NOT break the whole OCR subsystem or anything that calls
+# `list_available_engines()` (including /healthz).
 def _bootstrap_registry() -> None:
     if _ENGINE_CLASSES:
         return
-    from .rapidocr_engine import RapidOCREngine
-    from .tesseract_engine import TesseractEngine
+    for loader in (
+        _load_rapidocr, _load_tesseract,
+        _load_paddleocr, _load_docling, _load_trocr,
+    ):
+        try:
+            loader()
+        except Exception as e:
+            logger.debug(f"OCR engine unavailable: {loader.__name__} ({e})")
 
+
+def _load_rapidocr() -> None:
+    from .rapidocr_engine import RapidOCREngine
     _register(RapidOCREngine)
+
+def _load_tesseract() -> None:
+    from .tesseract_engine import TesseractEngine
     _register(TesseractEngine)
 
-    # Optional heavy engines
-    try:
-        from .paddleocr_engine import PaddleOCREngine
-        _register(PaddleOCREngine)
-    except Exception:
-        pass
-    try:
-        from .docling_engine import DoclingEngine
-        _register(DoclingEngine)
-    except Exception:
-        pass
-    try:
-        from .trocr_engine import TrOCREngine
-        _register(TrOCREngine)
-    except Exception:
-        pass
+def _load_paddleocr() -> None:
+    from .paddleocr_engine import PaddleOCREngine
+    _register(PaddleOCREngine)
+
+def _load_docling() -> None:
+    from .docling_engine import DoclingEngine
+    _register(DoclingEngine)
+
+def _load_trocr() -> None:
+    from .trocr_engine import TrOCREngine
+    _register(TrOCREngine)
 
 
 _instances: dict[str, OCREngine] = {}
