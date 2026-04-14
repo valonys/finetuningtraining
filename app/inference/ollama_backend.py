@@ -156,6 +156,32 @@ class OllamaInferenceBackend:
             logger.info(f"🦙 '{adapter_path}' → Ollama tag '{resolved}' for domain {domain_name}")
         self.lora_registry[domain_name] = resolved
 
+    def stream(self, req: GenerationRequest):
+        """
+        Yield response deltas as strings, live from Ollama's SSE stream.
+
+        Used by `InferenceManager.generate_stream()` → FastAPI's
+        `/v1/chat/stream` endpoint for Server-Sent Events so the UI shows
+        the typewriter effect as Nemotron emits tokens, rather than a
+        big reveal after generation completes.
+        """
+        model = self.lora_registry.get(req.domain_name) if req.domain_name != "base" else None
+        model = model or self._base_provider_model
+
+        original_model = self._provider.model
+        self._provider.model = model
+        try:
+            for delta in self._provider.stream_chat(
+                messages=[{"role": "user", "content": req.prompt}],
+                temperature=req.temperature,
+                top_p=req.top_p,
+                max_tokens=req.max_new_tokens,
+                stop=req.stop,
+            ):
+                yield delta
+        finally:
+            self._provider.model = original_model
+
     def generate(self, req: GenerationRequest) -> GenerationResponse:
         # Select the model: domain mapping takes precedence, else the base
         model = self.lora_registry.get(req.domain_name) if req.domain_name != "base" else None

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { chat as apiChat, listDomainConfigs } from "../api";
+import { chatStream, listDomainConfigs } from "../api";
 import { useApi } from "../hooks/useApi";
 import type { ChatResponse } from "../types";
 
@@ -62,8 +62,10 @@ function TypingDots() {
 }
 
 /* ── Message bubble ─────────────────────────────────────────── */
-function Bubble({ msg }: { msg: Message }) {
+function Bubble({ msg, streaming = false }: { msg: Message; streaming?: boolean }) {
   const isUser = msg.role === "user";
+  // Show a blinking caret after the text while this bubble is actively
+  // being streamed (delta-by-delta). Disappears once the stream ends.
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"} mb-3`}>
       {!isUser && (
@@ -80,6 +82,9 @@ function Bubble({ msg }: { msg: Message }) {
           }`}
         >
           {msg.text}
+          {streaming && msg.text && (
+            <span className="inline-block w-[0.5em] h-[1em] bg-gray-500 ml-0.5 align-text-bottom animate-pulse" />
+          )}
         </div>
         {msg.meta && (
           <div className="mt-1 text-[10px] text-gray-400 font-mono px-1">
@@ -130,36 +135,65 @@ export default function ChatWidget() {
     if (!text || sending) return;
     setInput("");
 
+    // Seed the conversation with the user's message and an empty
+    // assistant placeholder. As SSE deltas arrive we append to the
+    // placeholder's `text` — React re-renders → typewriter effect.
     const userMsg: Message = {
       id: crypto.randomUUID(),
       role: "user",
       text,
       ts: Date.now(),
     };
-    setMessages((m) => [...m, userMsg]);
+    const assistantId = crypto.randomUUID();
+    const assistantMsg: Message = {
+      id: assistantId,
+      role: "assistant",
+      text: "",
+      ts: Date.now(),
+    };
+    setMessages((m) => [...m, userMsg, assistantMsg]);
     setSending(true);
 
+    const updateAssistant = (patch: (m: Message) => Message) => {
+      setMessages((all) =>
+        all.map((msg) => (msg.id === assistantId ? patch(msg) : msg))
+      );
+    };
+
     try {
-      const res = await apiChat({
-        message: text,
-        domain_config_name: domain,
-        temperature,
-        max_new_tokens: maxTokens,
-      });
-      const assistantMsg: Message = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        text: res.response,
-        meta: res,
-        ts: Date.now(),
-      };
-      setMessages((m) => [...m, assistantMsg]);
+      await chatStream(
+        {
+          message: text,
+          domain_config_name: domain,
+          temperature,
+          max_new_tokens: maxTokens,
+        },
+        {
+          onDelta: (delta) => {
+            updateAssistant((m) => ({ ...m, text: m.text + delta }));
+          },
+          onMeta: (meta) => {
+            // Merge in the final meta frame (backend, model, TTFT, tokens, ...)
+            // so the footnote under the bubble lights up.
+            updateAssistant((m) => ({
+              ...m,
+              meta: { ...(m.meta ?? {}), ...meta } as ChatResponse,
+            }));
+          },
+          onError: (err) => {
+            updateAssistant((m) => ({
+              ...m,
+              text: m.text ? `${m.text}\n\n[stream error: ${err}]` : `Error: ${err}`,
+            }));
+          },
+        }
+      );
       if (!open) setUnread((u) => u + 1);
     } catch (e) {
-      setMessages((m) => [
+      updateAssistant((m) => ({
         ...m,
-        { id: crypto.randomUUID(), role: "assistant", text: `Error: ${e}`, ts: Date.now() },
-      ]);
+        text: m.text || `Error: ${e}`,
+      }));
     } finally {
       setSending(false);
     }
@@ -275,8 +309,20 @@ export default function ChatWidget() {
                 </p>
               </div>
             )}
-            {messages.map((m) => <Bubble key={m.id} msg={m} />)}
-            {sending && <TypingDots />}
+            {messages.map((m, i) => {
+              const isLast = i === messages.length - 1;
+              const isStreaming = sending && isLast && m.role === "assistant" && !m.meta;
+              return <Bubble key={m.id} msg={m} streaming={isStreaming} />;
+            })}
+            {(() => {
+              // Typing dots only BEFORE the first delta arrives — once the
+              // assistant bubble has any text, the growing text itself
+              // tells the user something's happening.
+              const last = messages[messages.length - 1];
+              const preFirstToken =
+                sending && last?.role === "assistant" && !last.text;
+              return preFirstToken ? <TypingDots /> : null;
+            })()}
           </div>
 
           {/* Input */}

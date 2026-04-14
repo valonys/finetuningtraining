@@ -42,6 +42,8 @@ from typing import Any, Dict, List
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from starlette.concurrency import iterate_in_threadpool
 
 from app import __version__
 from app.config_loader import (
@@ -619,4 +621,89 @@ async def chat(req: ChatRequest):
         ttft_ms=resp.ttft_ms,
         latency_ms=resp.latency_ms,
         tokens_per_second=resp.tokens_per_second,
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# Streaming chat — Server-Sent Events (SSE)
+# ──────────────────────────────────────────────────────────────
+@app.post("/v1/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """
+    Stream the assistant response back as text/event-stream so the UI
+    can show the typewriter effect — tokens appear in the chat bubble
+    as Nemotron (or whichever model) emits them, instead of the user
+    staring at a spinner for 5 seconds before the whole reply appears.
+
+    Frame format (one per line, separated by `\\n\\n`):
+        data: {"delta": "Hello"}
+        data: {"delta": " world"}
+        data: {"meta": {"backend":"ollama","ttft_ms":950, ...}}
+        data: [DONE]
+
+    An errored stream emits a final `data: {"error": "..."}` frame
+    before [DONE] so the frontend can surface the message rather than
+    the request silently aborting.
+
+    Only backends that expose `stream()` on the underlying backend
+    class support this endpoint — currently `ollama`. Others return
+    HTTP 501.
+    """
+    engine = get_inference_engine(DEFAULT_BASE_MODEL, backend=DEFAULT_INFERENCE_BACKEND)
+
+    from app.templates import get_template_for
+    template = get_template_for(engine.base_model_id)
+
+    system_prompt = "You are a helpful assistant."
+    if req.domain_config_name and req.domain_config_name != "base":
+        try:
+            cfg = load_domain_config(req.domain_config_name)
+            system_prompt = cfg.get("system_prompt", system_prompt)
+        except FileNotFoundError:
+            pass
+
+    prompt = template.format_prompt_only(system=system_prompt, instruction=req.message)
+    gen_req = GenerationRequest(
+        prompt=prompt,
+        domain_name=req.domain_config_name or "base",
+        temperature=req.temperature,
+        max_new_tokens=req.max_new_tokens,
+    )
+
+    def _sync_generator():
+        """Yield backend deltas (strings) and the final meta dict."""
+        try:
+            yield from engine.generate_stream(gen_req)
+        except NotImplementedError as e:
+            yield {"__error__": True, "message": str(e), "status": 501}
+        except Exception as e:
+            logger.exception("chat_stream: backend error")
+            yield {"__error__": True, "message": str(e), "status": 500}
+
+    async def event_source():
+        # iterate_in_threadpool bridges our sync generator to the async
+        # event loop without blocking it — each backend-yielded chunk
+        # arrives as soon as Ollama hands it over the wire.
+        import json as _json
+        try:
+            async for item in iterate_in_threadpool(_sync_generator()):
+                if isinstance(item, dict) and item.get("__error__"):
+                    yield f"data: {_json.dumps({'error': item['message']})}\n\n"
+                elif isinstance(item, dict) and item.get("__meta__"):
+                    meta = {k: v for k, v in item.items() if not k.startswith("__")}
+                    yield f"data: {_json.dumps({'meta': meta})}\n\n"
+                else:
+                    yield f"data: {_json.dumps({'delta': item})}\n\n"
+        finally:
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            # Disable buffering from nginx / Vite proxy so bytes flow immediately
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )

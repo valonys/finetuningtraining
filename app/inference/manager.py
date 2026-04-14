@@ -121,6 +121,64 @@ class InferenceManager:
     def generate_full(self, req: GenerationRequest) -> GenerationResponse:
         return self._backend.generate(req)
 
+    def generate_stream(self, req: GenerationRequest):
+        """
+        Incremental generation — yields text deltas as they arrive, then
+        a final dict with summary metadata (backend, model, ttft_ms,
+        latency_ms, tokens_generated, tokens_per_second).
+
+        Downstream SSE endpoint wraps each yielded item into a
+        `data: {json}\\n\\n` frame. Backends that don't support token-
+        level streaming (vLLM's simple path, mlx without `stream_generate`,
+        etc.) may fall back to a single final-delta emission — the
+        contract is preserved, just coarser.
+
+        For now the Ollama backend is the authoritative streaming path
+        (Server-Sent Events from Ollama Cloud or the local daemon). Other
+        backends raise NotImplementedError which the endpoint converts
+        to a 501 with a helpful message.
+        """
+        import time
+        if not hasattr(self._backend, "stream"):
+            raise NotImplementedError(
+                f"Backend '{self._backend_name}' does not yet support "
+                f"token streaming. Use /v1/chat for a batched response, "
+                f"or switch to the ollama backend via "
+                f"VALONY_INFERENCE_BACKEND=ollama."
+            )
+        t_start = time.perf_counter()
+        ttft_ms = 0.0
+        n_tokens = 0
+        model_used = getattr(self._backend, "model_id", self.base_model_id)
+
+        for delta in self._backend.stream(req):
+            if n_tokens == 0:
+                ttft_ms = (time.perf_counter() - t_start) * 1000
+            n_tokens += 1
+            yield delta
+
+        t_end = time.perf_counter()
+        lat_ms = (t_end - t_start) * 1000
+        tps = (n_tokens / (t_end - t_start)) if (t_end > t_start and n_tokens) else 0.0
+
+        # Record in the rolling telemetry so /healthz reflects stream stats too
+        if ttft_ms:
+            self._ttft_samples.append(ttft_ms)
+        self._lat_samples.append(lat_ms)
+        _trim(self._ttft_samples)
+        _trim(self._lat_samples)
+
+        yield {
+            "__meta__": True,
+            "backend": self._backend_name,
+            "model": model_used,
+            "domain": req.domain_name,
+            "ttft_ms": ttft_ms or (lat_ms / max(n_tokens, 1)),
+            "latency_ms": lat_ms,
+            "tokens_generated": n_tokens,
+            "tokens_per_second": tps,
+        }
+
     def register_adapter(self, domain_name: str, adapter_path: str) -> None:
         self.lora_registry[domain_name] = adapter_path
         if hasattr(self._backend, "register_adapter"):
