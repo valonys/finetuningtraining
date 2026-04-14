@@ -66,14 +66,26 @@ export const forgeBuildDataset = (body: {
   paths: string[];
   task: string;
   base_model: string;
+  template?: string;
   system_prompt: string;
   synth_qa: boolean;
   target_size: number | null;
+  filter_noise?: boolean;
 }) =>
   call<ForgeBuildResponse>("/v1/forge/build_dataset", {
     method: "POST",
     body: JSON.stringify(body),
   });
+
+export const forgeHarvestYoutube = (body: {
+  query: string;
+  max_videos: number;
+  min_chars?: number;
+}) =>
+  call<import("./types").YouTubeHarvestResponse>(
+    "/v1/forge/harvest/youtube",
+    { method: "POST", body: JSON.stringify(body) }
+  );
 
 /**
  * Upload one or more files via multipart/form-data. Do NOT set a

@@ -1,0 +1,43 @@
+domain_name: ai_llm_test
+system_prompt: You are a senior AI advocate and Evangelist
+constitution:
+- Neveer speculate without noting uncertainty
+training_args:
+  lora_r: 16
+  lora_alpha: 32
+  learning_rate: 0.0002
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  num_train_epochs: 1
+  max_steps: -1
+  max_seq_length: 2048
+dpo_args:
+  learning_rate: 5.0e-05
+  beta: 0.1
+  num_train_epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  max_length: 2048
+orpo_args:
+  learning_rate: 8.0e-06
+  beta: 0.1
+  num_train_epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  max_length: 2048
+kto_args:
+  learning_rate: 5.0e-06
+  beta: 0.1
+  desirable_weight: 1.0
+  undesirable_weight: 1.0
+  num_train_epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 8
+grpo_args:
+  num_generations: 8
+  temperature: 0.8
+  max_new_tokens: 400
+  learning_rate: 5.0e-06
+  num_train_epochs: 2
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16

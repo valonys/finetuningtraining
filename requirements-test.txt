@@ -21,3 +21,6 @@ pyyaml>=6.0             # app.config_loader
 pydantic>=2.6           # app.models
 requests>=2.31          # app.providers.ollama (chat / stream_chat)
 rank_bm25>=0.2.2        # app.rag.retriever
+# yt-dlp and youtube-transcript-api are NOT in the test deps -- the
+# harvester is tested with mocks. Leaving them out keeps CI fast and
+# avoids pulling in their heavy dependency trees.

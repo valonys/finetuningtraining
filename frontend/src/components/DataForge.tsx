@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   forgeBuildDataset,
+  forgeHarvestYoutube,
   forgeClearUploads,
   forgeDeleteUpload,
   forgeListUploads,
@@ -54,6 +55,14 @@ export default function DataForge() {
   /* Dataset build form */
   const [task, setTask] = useState<string>("sft");
   const [baseModel, setBaseModel] = useState("Qwen/Qwen2.5-7B-Instruct");
+  const [template, setTemplate] = useState<string>("auto");     // chat-template override
+  const [filterNoise, setFilterNoise] = useState(true);         // drop TOC / covers / bibliography
+
+  /* YouTube harvester form */
+  const [ytQuery, setYtQuery] = useState("");
+  const [ytMaxVideos, setYtMaxVideos] = useState(10);
+  const [harvesting, setHarvesting] = useState(false);
+  const [harvestResult, setHarvestResult] = useState<string | null>(null);
   const [sysPrompt, setSysPrompt] = useState("You are a helpful assistant.");
   const [synthQa, setSynthQa] = useState(true);
   const [targetSize, setTargetSize] = useState(500);
@@ -139,9 +148,11 @@ export default function DataForge() {
         paths: uploaded.map((f) => f.path),
         task,
         base_model: baseModel,
+        template: template,              // "auto" or specific family name
         system_prompt: sysPrompt,
         synth_qa: synthQa,
         target_size: targetSize || null,
+        filter_noise: filterNoise,
       });
       setBuildResult(
         `Built ${res.task} dataset with template "${res.template}"\n` +
@@ -155,6 +166,48 @@ export default function DataForge() {
       setBuildResult(String(e));
     } finally {
       setBuilding(false);
+    }
+  };
+
+  /* ── YouTube harvester flow ─────────────────────────── */
+  const handleHarvestYoutube = async () => {
+    if (!ytQuery.trim()) {
+      setHarvestResult("Enter a keyword query first.");
+      return;
+    }
+    setHarvesting(true);
+    setHarvestResult(null);
+    try {
+      const res = await forgeHarvestYoutube({
+        query: ytQuery.trim(),
+        max_videos: ytMaxVideos,
+      });
+      const ok = res.harvested.length;
+      const skipped = res.skipped.length;
+      const lines = [
+        `Harvested ${ok} of ${res.max_requested} videos for query "${res.query}".`,
+        "",
+        ...res.harvested.map(
+          (h, i) =>
+            `${String(i + 1).padStart(2, "0")}. ${h.title}\n` +
+            `    ${h.channel} | ${h.char_count.toLocaleString()} chars | ` +
+            `${h.language}${h.auto_generated ? " (auto)" : ""}\n` +
+            `    ${h.file_path}`
+        ),
+      ];
+      if (skipped > 0) {
+        lines.push("", `Skipped (${skipped}):`);
+        for (const s of res.skipped) {
+          lines.push(`  - ${s.title}: ${s.reason}`);
+        }
+      }
+      lines.push("", "Refresh the Uploaded files list below to see the new .txt files.");
+      setHarvestResult(lines.join("\n"));
+      await refresh();   // re-pull the uploads list so the new files appear
+    } catch (e) {
+      setHarvestResult(String(e));
+    } finally {
+      setHarvesting(false);
     }
   };
 
@@ -244,6 +297,59 @@ export default function DataForge() {
         </div>
       )}
 
+      {/* ── YouTube harvester ───────────────────────── */}
+      <div className="bg-white border rounded-lg p-5 space-y-3">
+        <div className="flex items-center gap-2 text-sm font-semibold text-gray-900">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5 text-red-600">
+            <path d="M19.615 3.184c-3.604-.246-11.631-.245-15.23 0-3.897.266-4.356 2.62-4.385 8.816.029 6.185.484 8.549 4.385 8.816 3.6.245 11.626.246 15.23 0 3.897-.266 4.356-2.62 4.385-8.816-.029-6.185-.484-8.549-4.385-8.816zm-10.615 12.816v-8l8 3.993-8 4.007z" />
+          </svg>
+          Harvest transcripts from YouTube
+        </div>
+        <p className="text-xs text-gray-500">
+          Keyword search finds the top N matching videos on YouTube and fetches
+          their captions (no audio download, no Whisper, no API key). Each
+          transcript lands as a <code>.txt</code> file under <code>./data/uploads/</code>{" "}
+          and appears in the file list below, ready to be built into a dataset.
+        </p>
+        <div className="grid md:grid-cols-[1fr_auto] gap-3 items-end">
+          <label className="block text-sm">
+            <span className="text-gray-600 font-medium">Keyword query</span>
+            <input
+              className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+              value={ytQuery}
+              onChange={(e) => setYtQuery(e.target.value)}
+              placeholder="e.g. asset integrity inspection FPSO"
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !harvesting) handleHarvestYoutube();
+              }}
+            />
+          </label>
+          <label className="block text-sm">
+            <span className="text-gray-600 font-medium">Max videos</span>
+            <input
+              type="number"
+              min={1}
+              max={25}
+              className="mt-1 block w-24 rounded border px-3 py-2 text-sm"
+              value={ytMaxVideos}
+              onChange={(e) => setYtMaxVideos(Number(e.target.value))}
+            />
+          </label>
+        </div>
+        <button
+          onClick={handleHarvestYoutube}
+          disabled={harvesting || !ytQuery.trim()}
+          className="btn-primary"
+        >
+          {harvesting ? "Harvesting transcripts..." : "Harvest from YouTube"}
+        </button>
+        {harvestResult && (
+          <pre className="bg-gray-50 border rounded p-3 text-xs font-mono whitespace-pre-wrap max-h-72 overflow-y-auto">
+            {harvestResult}
+          </pre>
+        )}
+      </div>
+
       {/* ── File list ───────────────────────────────── */}
       <div className="bg-white border rounded-lg overflow-hidden">
         <div className="flex items-center justify-between px-4 py-2.5 border-b bg-gray-50">
@@ -303,7 +409,7 @@ export default function DataForge() {
       <div className="bg-white border rounded-lg p-6 space-y-4">
         <h3 className="font-semibold text-gray-900">Build training dataset</h3>
 
-        <div className="grid md:grid-cols-3 gap-4">
+        <div className="grid md:grid-cols-2 gap-4">
           <label className="block text-sm">
             <span className="text-gray-600 font-medium">Task</span>
             <select
@@ -315,14 +421,6 @@ export default function DataForge() {
             </select>
           </label>
           <label className="block text-sm">
-            <span className="text-gray-600 font-medium">Base model</span>
-            <input
-              className="mt-1 block w-full rounded border px-3 py-2 text-sm"
-              value={baseModel}
-              onChange={(e) => setBaseModel(e.target.value)}
-            />
-          </label>
-          <label className="block text-sm">
             <span className="text-gray-600 font-medium">Target size (rows)</span>
             <input
               type="number"
@@ -330,6 +428,46 @@ export default function DataForge() {
               value={targetSize}
               onChange={(e) => setTargetSize(Number(e.target.value))}
             />
+          </label>
+          <label className="block text-sm">
+            <span className="text-gray-600 font-medium">Base model</span>
+            <input
+              className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+              value={baseModel}
+              onChange={(e) => setBaseModel(e.target.value)}
+              placeholder="Qwen/Qwen2.5-7B-Instruct"
+            />
+          </label>
+          <label className="block text-sm">
+            <span className="text-gray-600 font-medium">
+              Chat template
+              {template === "auto" && (
+                <span className="ml-2 text-xs text-gray-400 font-normal">
+                  (auto-resolved from base model)
+                </span>
+              )}
+            </span>
+            <select
+              className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+              value={template}
+              onChange={(e) => setTemplate(e.target.value)}
+            >
+              <option value="auto">Auto (match base model)</option>
+              <optgroup label="Instruction-tuned families">
+                <option value="qwen">Qwen (Qwen2 / Qwen2.5 / Qwen3)</option>
+                <option value="llama3">Llama 3 / 3.1 / 3.2 / 3.3</option>
+                <option value="llama2">Llama 2</option>
+                <option value="mistral">Mistral / Mixtral</option>
+                <option value="gemma">Gemma 1 / 2 / 3</option>
+                <option value="phi">Phi 3 / 4</option>
+                <option value="deepseek">DeepSeek V2 / V3 / R1</option>
+              </optgroup>
+              <optgroup label="Generic formats">
+                <option value="chatml">ChatML (OpenAI / Nous / Yi)</option>
+                <option value="alpaca">Alpaca (Stanford / Vicuna)</option>
+                <option value="sharegpt">ShareGPT</option>
+              </optgroup>
+            </select>
           </label>
         </div>
 
@@ -342,10 +480,20 @@ export default function DataForge() {
           />
         </label>
 
+        <div className="flex flex-wrap gap-4">
         <label className="flex items-center gap-2 text-sm">
           <input type="checkbox" checked={synthQa} onChange={(e) => setSynthQa(e.target.checked)} />
           Synthesize Q/A pairs (uses the configured synth provider)
         </label>
+        <label className="flex items-center gap-2 text-sm" title="Reject chunks that look like book front-matter, TOCs, and bibliography fragments before Q/A synthesis.">
+          <input
+            type="checkbox"
+            checked={filterNoise}
+            onChange={(e) => setFilterNoise(e.target.checked)}
+          />
+          Filter noise (drop covers / TOCs / bibliographies)
+        </label>
+        </div>
 
         <button
           onClick={handleBuild}
