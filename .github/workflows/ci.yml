@@ -38,12 +38,17 @@ jobs:
           cache: pip
 
       - name: Install minimal dependencies
-        # Smoke tests only need pytest + pyyaml + pydantic + requests.
+        # Smoke tests need:
+        #   pytest          — runner
+        #   pytest-asyncio  — for the async save_upload tests in test_uploads.py
+        #   pyyaml          — config_loader
+        #   pydantic        — app.models
+        #   requests        — app.providers.ollama.chat / stream_chat
         # We do NOT install torch, transformers, trl, unsloth, mlx, vllm,
         # bitsandbytes, etc. — the tests are designed to run without them.
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pyyaml "pydantic>=2.6" requests
+          pip install pytest "pytest-asyncio>=0.23" pyyaml "pydantic>=2.6" requests
 
       - name: Run all no-GPU tests
         run: pytest tests/ -v

@@ -74,6 +74,13 @@ dev = [
 requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.pytest.ini_options]
+# `auto` mode so pytest-asyncio picks up every `async def test_*` without
+# each test having to carry an explicit `@pytest.mark.asyncio` decorator —
+# and the tests that DO carry one still work.
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
