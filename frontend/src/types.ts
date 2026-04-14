@@ -109,3 +109,11 @@ export interface ChatResponse {
   latency_ms: number;
   tokens_per_second: number;
 }
+
+/** A retrieved Docs article (only emitted by the SSE stream in docs mode). */
+export interface DocsSource {
+  title: string;
+  section: string;
+  article_id: string;
+  score: number;
+}

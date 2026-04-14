@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { chatStream, listDomainConfigs } from "../api";
 import { useApi } from "../hooks/useApi";
-import type { ChatResponse } from "../types";
+import type { ChatResponse, DocsSource } from "../types";
 
 /* ── Types ──────────────────────────────────────────────────── */
 interface Message {
@@ -9,8 +11,12 @@ interface Message {
   role: "user" | "assistant";
   text: string;
   meta?: ChatResponse;
+  sources?: DocsSource[];
   ts: number;
 }
+
+/** Special domain id that triggers RAG-over-docs on the backend. */
+const DOMAIN_DOCS = "docs";
 
 /* ── Icons (inline SVG, no deps) ────────────────────────────── */
 const ChatIcon = () => (
@@ -64,8 +70,25 @@ function TypingDots() {
 /* ── Message bubble ─────────────────────────────────────────── */
 function Bubble({ msg, streaming = false }: { msg: Message; streaming?: boolean }) {
   const isUser = msg.role === "user";
-  // Show a blinking caret after the text while this bubble is actively
-  // being streamed (delta-by-delta). Disappears once the stream ends.
+
+  // Tailwind `prose` styling (via @tailwindcss/typography) gives us
+  // proper headings / lists / tables / code rendering for the
+  // markdown emitted by the assistant. We tighten it for chat with
+  // `prose-sm` and override a handful of margins so dense replies
+  // don't waste vertical space.
+  const proseClasses =
+    "prose prose-sm max-w-none " +
+    "prose-headings:font-semibold prose-headings:mt-3 prose-headings:mb-1.5 " +
+    "prose-h2:text-base prose-h3:text-sm " +
+    "prose-p:my-1.5 prose-li:my-0.5 " +
+    "prose-ul:my-1.5 prose-ol:my-1.5 " +
+    "prose-code:bg-gray-200 prose-code:rounded prose-code:px-1 prose-code:py-0.5 " +
+    "prose-code:before:content-[''] prose-code:after:content-[''] " +
+    "prose-pre:bg-gray-900 prose-pre:text-gray-100 prose-pre:my-2 " +
+    "prose-table:my-2 prose-th:bg-gray-50 prose-td:px-2 prose-th:px-2 " +
+    "prose-blockquote:border-l-blue-300 prose-blockquote:bg-blue-50/40 " +
+    "prose-blockquote:py-0.5 prose-blockquote:not-italic";
+
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"} mb-3`}>
       {!isUser && (
@@ -73,19 +96,49 @@ function Bubble({ msg, streaming = false }: { msg: Message; streaming?: boolean 
           <img src="/ValonyLabs_Logo.png" alt="" className="w-7 h-7 rounded-full" />
         </div>
       )}
-      <div className={`max-w-[80%] ${isUser ? "order-1" : ""}`}>
+      <div className={`max-w-[85%] ${isUser ? "order-1" : ""}`}>
         <div
-          className={`rounded-2xl px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap ${
+          className={`rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
             isUser
-              ? "bg-blue-600 text-white rounded-br-md"
+              ? "bg-blue-600 text-white rounded-br-md whitespace-pre-wrap"
               : "bg-gray-100 text-gray-900 rounded-bl-md"
           }`}
         >
-          {msg.text}
-          {streaming && msg.text && (
-            <span className="inline-block w-[0.5em] h-[1em] bg-gray-500 ml-0.5 align-text-bottom animate-pulse" />
+          {isUser ? (
+            msg.text
+          ) : (
+            <>
+              <div className={proseClasses}>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  {msg.text || (streaming ? "" : "*(empty response)*")}
+                </ReactMarkdown>
+              </div>
+              {streaming && msg.text && (
+                <span className="inline-block w-[0.5em] h-[1em] bg-gray-500 ml-0.5 align-text-bottom animate-pulse" />
+              )}
+            </>
           )}
         </div>
+
+        {/* Citation badges — only present in Docs RAG mode */}
+        {msg.sources && msg.sources.length > 0 && (
+          <div className="mt-1.5 px-1 flex flex-wrap gap-1">
+            <span className="text-[10px] text-gray-500 font-medium uppercase tracking-wide">
+              Sources:
+            </span>
+            {msg.sources.map((s) => (
+              <span
+                key={s.article_id}
+                title={`${s.section} · score ${s.score.toFixed(2)}`}
+                className="inline-flex items-center gap-1 text-[10px] bg-blue-50 text-blue-700
+                           border border-blue-200 rounded-full px-2 py-0.5"
+              >
+                {s.title}
+              </span>
+            ))}
+          </div>
+        )}
+
         {msg.meta && (
           <div className="mt-1 text-[10px] text-gray-400 font-mono px-1">
             {msg.meta.backend} &middot; {msg.meta.ttft_ms.toFixed(0)}ms TTFT &middot;{" "}
@@ -112,10 +165,12 @@ export default function ChatWidget() {
   const [sending, setSending] = useState(false);
   const [unread, setUnread] = useState(0);
 
-  /* Settings */
-  const [domain, setDomain] = useState("base");
-  const [temperature, setTemperature] = useState(0.7);
-  const [maxTokens, setMaxTokens] = useState(512);
+  /* Settings — default to "docs" so the assistant boots up as a
+     Studio Docs RAG helper rather than a generic chat. Users can
+     swap to "base" or any trained adapter from the dropdown. */
+  const [domain, setDomain] = useState(DOMAIN_DOCS);
+  const [temperature, setTemperature] = useState(0.4);    // tighter for docs answers
+  const [maxTokens, setMaxTokens] = useState(800);        // larger for formatted responses
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -169,6 +224,12 @@ export default function ChatWidget() {
           max_new_tokens: maxTokens,
         },
         {
+          onSources: (sources) => {
+            // Docs-mode RAG retrieval — attach citation badges to the
+            // assistant bubble before any delta arrives, so the user
+            // sees what the answer is grounded in immediately.
+            updateAssistant((m) => ({ ...m, sources }));
+          },
           onDelta: (delta) => {
             updateAssistant((m) => ({ ...m, text: m.text + delta }));
           },
@@ -236,8 +297,11 @@ export default function ChatWidget() {
             <div className="flex-1 min-w-0">
               <h3 className="text-sm font-semibold leading-tight">ValonyLabs Assistant</h3>
               <p className="text-[11px] text-slate-400 truncate">
-                {domain === "base" ? "Base model" : domain} &middot;{" "}
-                {(domains?.configs.length ?? 0) + 1} domains available
+                {domain === DOMAIN_DOCS
+                  ? "📚 Docs RAG · grounded in the in-app documentation"
+                  : domain === "base"
+                  ? "🤖 Base model · raw, no adapter"
+                  : `🎯 ${domain} · trained adapter`}
               </p>
             </div>
             <button
@@ -266,10 +330,15 @@ export default function ChatWidget() {
                   value={domain}
                   onChange={(e) => setDomain(e.target.value)}
                 >
-                  <option value="base">base (raw model)</option>
-                  {(domains?.configs ?? []).map((c) => (
-                    <option key={c} value={c}>{c}</option>
-                  ))}
+                  <optgroup label="📚 Help">
+                    <option value={DOMAIN_DOCS}>Docs (RAG over help articles)</option>
+                  </optgroup>
+                  <optgroup label="🤖 Inference">
+                    <option value="base">Base model (no adapter)</option>
+                    {(domains?.configs ?? []).map((c) => (
+                      <option key={c} value={c}>{`🎯 ${c} (trained adapter)`}</option>
+                    ))}
+                  </optgroup>
                 </select>
               </label>
               <div className="flex gap-4">
@@ -299,14 +368,29 @@ export default function ChatWidget() {
           {/* Messages */}
           <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
             {messages.length === 0 && (
-              <div className="text-center mt-12">
+              <div className="text-center mt-8 px-4">
                 <img src="/ValonyLabs_Logo.png" alt="" className="w-16 h-16 mx-auto opacity-20 mb-4" />
-                <p className="text-gray-400 text-sm font-medium">
-                  How can I help you today?
+                <p className="text-gray-500 text-sm font-medium mb-3">
+                  {domain === DOMAIN_DOCS
+                    ? "Ask me about ValonyLabs Studio"
+                    : domain === "base"
+                    ? "Chatting with the base model"
+                    : `Testing trained adapter: ${domain}`}
                 </p>
-                <p className="text-gray-300 text-xs mt-1">
-                  Ask anything about your domain or start a conversation.
-                </p>
+                {domain === DOMAIN_DOCS && (
+                  <div className="text-left text-[11px] text-gray-400 space-y-1.5 max-w-[280px] mx-auto">
+                    <p className="text-gray-500 font-medium">Try:</p>
+                    <p>&quot;How do I upload a PDF?&quot;</p>
+                    <p>&quot;Difference between SFT and DPO?&quot;</p>
+                    <p>&quot;Can I train a model from scratch?&quot;</p>
+                    <p>&quot;Set up Ollama Cloud&quot;</p>
+                  </div>
+                )}
+                {domain !== DOMAIN_DOCS && (
+                  <p className="text-gray-400 text-xs">
+                    Use the gear icon to switch domain or tune temperature.
+                  </p>
+                )}
               </div>
             )}
             {messages.map((m, i) => {

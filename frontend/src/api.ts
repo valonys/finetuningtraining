@@ -164,6 +164,7 @@ export async function chatStream(
     onDelta?: (delta: string) => void;
     onMeta?: (meta: Partial<ChatResponse>) => void;
     onError?: (error: string) => void;
+    onSources?: (sources: import("./types").DocsSource[]) => void;
   },
   signal?: AbortSignal
 ): Promise<void> {
@@ -211,8 +212,10 @@ export async function chatStream(
           delta?: string;
           meta?: Partial<ChatResponse>;
           error?: string;
+          sources?: import("./types").DocsSource[];
         };
         if (obj.error !== undefined && callbacks.onError) callbacks.onError(obj.error);
+        else if (obj.sources !== undefined && callbacks.onSources) callbacks.onSources(obj.sources);
         else if (obj.delta !== undefined && callbacks.onDelta) callbacks.onDelta(obj.delta);
         else if (obj.meta !== undefined && callbacks.onMeta) callbacks.onMeta(obj.meta);
       } catch {

@@ -654,13 +654,27 @@ async def chat_stream(req: ChatRequest):
     from app.templates import get_template_for
     template = get_template_for(engine.base_model_id)
 
-    system_prompt = "You are a helpful assistant."
-    if req.domain_config_name and req.domain_config_name != "base":
-        try:
-            cfg = load_domain_config(req.domain_config_name)
-            system_prompt = cfg.get("system_prompt", system_prompt)
-        except FileNotFoundError:
-            pass
+    # ── Three modes ──────────────────────────────────────────────
+    #   "docs"   → RAG over the in-app Docs corpus, force-formatted
+    #              MS-Office-style markdown response, citations
+    #   <name>   → use the named domain config's system_prompt
+    #   "base"   → talk to the raw base model
+    docs_mode = (req.domain_config_name or "").lower() == "docs"
+    sources_payload: List[Dict[str, Any]] = []
+
+    if docs_mode:
+        from app.rag import build_rag_prompt
+        from app.rag.prompts import hits_to_sources
+        system_prompt, hits = build_rag_prompt(req.message, k=5)
+        sources_payload = hits_to_sources(hits)
+    else:
+        system_prompt = "You are a helpful assistant."
+        if req.domain_config_name and req.domain_config_name != "base":
+            try:
+                cfg = load_domain_config(req.domain_config_name)
+                system_prompt = cfg.get("system_prompt", system_prompt)
+            except FileNotFoundError:
+                pass
 
     prompt = template.format_prompt_only(system=system_prompt, instruction=req.message)
     gen_req = GenerationRequest(
@@ -685,12 +699,21 @@ async def chat_stream(req: ChatRequest):
         # event loop without blocking it — each backend-yielded chunk
         # arrives as soon as Ollama hands it over the wire.
         import json as _json
+
+        # Emit retrieved sources up-front (only in docs mode) so the UI
+        # can render citation badges before the answer streams in.
+        if sources_payload:
+            yield f"data: {_json.dumps({'sources': sources_payload})}\n\n"
+
         try:
             async for item in iterate_in_threadpool(_sync_generator()):
                 if isinstance(item, dict) and item.get("__error__"):
                     yield f"data: {_json.dumps({'error': item['message']})}\n\n"
                 elif isinstance(item, dict) and item.get("__meta__"):
                     meta = {k: v for k, v in item.items() if not k.startswith("__")}
+                    if sources_payload:
+                        meta["sources_count"] = len(sources_payload)
+                        meta["mode"] = "docs"
                     yield f"data: {_json.dumps({'meta': meta})}\n\n"
                 else:
                     yield f"data: {_json.dumps({'delta': item})}\n\n"
