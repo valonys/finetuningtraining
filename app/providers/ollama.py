@@ -49,7 +49,11 @@ class OllamaProvider(SynthProvider):
 
     DEFAULT_LOCAL_BASE = "http://localhost:11434"
     DEFAULT_CLOUD_BASE = "https://ollama.com"
-    DEFAULT_CLOUD_MODEL = "nemotron"     # Llama-3.1-Nemotron-70B
+    # Ollama Cloud catalog tag (verified live via /v1/models).
+    # "nemotron" alone returns HTTP 404 — the registered id is
+    # "nemotron-3-super". Query `curl https://ollama.com/v1/models` with
+    # your OLLAMA_API_KEY to see the full current list.
+    DEFAULT_CLOUD_MODEL = "nemotron-3-super"
     DEFAULT_LOCAL_MODEL = "llama3.1"     # reasonable local default
 
     def __init__(

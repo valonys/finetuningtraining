@@ -23,7 +23,7 @@ def test_cloud_defaults_when_api_key_set(monkeypatch):
     assert p.is_cloud
     assert "ollama.com" in p.base_url
     assert p.base_url.endswith("/v1")
-    assert p.model == "nemotron"       # cloud default
+    assert p.model == "nemotron-3-super"       # cloud default (verified via /v1/models)
     assert p.api_key == "sk-fake"
 
 
@@ -96,7 +96,7 @@ def test_chat_returns_content_on_200(monkeypatch):
         assert out == "hello from nemotron"
         mocked.assert_called_once()
         call_kwargs = mocked.call_args.kwargs
-        assert call_kwargs["json"]["model"] == "nemotron"
+        assert call_kwargs["json"]["model"] == "nemotron-3-super"
         assert call_kwargs["json"]["messages"] == [{"role": "user", "content": "hi"}]
         assert call_kwargs["headers"]["Authorization"] == "Bearer k"
         assert call_kwargs["json"]["stream"] is False

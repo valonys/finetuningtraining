@@ -108,5 +108,5 @@ def test_describe_active_provider_when_ollama_cloud(monkeypatch):
     from app.providers import describe_active_provider
     info = describe_active_provider()
     assert info["provider"] == "ollama"
-    assert info["model"] == "nemotron"
+    assert info["model"] == "nemotron-3-super"
     assert info["is_cloud"] is True
