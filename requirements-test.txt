@@ -1,0 +1,23 @@
+# Minimal Python deps needed to run the no-GPU test suite under tests/.
+# CI installs from this file instead of an inline pip list so that when
+# new modules add new deps (happened three times so far: python-multipart
+# for uploads, pytest-asyncio for async streaming, rank_bm25 for the
+# Docs RAG), there's one place to update and CI stays in sync.
+#
+# Keep this file LEAN — only what `pytest tests/` actually needs. We
+# deliberately skip torch / transformers / trl / unsloth / mlx / vllm /
+# bitsandbytes / heavy OCR deps. All tests mock those out.
+#
+# Local dev (if you just want to run tests without the full stack):
+#     pip install -r requirements-test.txt
+#     pytest tests/ -v
+
+# ── Test runner ────────────────────────────────────────────────
+pytest>=8.2
+pytest-asyncio>=0.23   # tests/test_uploads.py async save_upload
+
+# ── Imported by app.* modules under test ──────────────────────
+pyyaml>=6.0             # app.config_loader
+pydantic>=2.6           # app.models
+requests>=2.31          # app.providers.ollama (chat / stream_chat)
+rank_bm25>=0.2.2        # app.rag.retriever
