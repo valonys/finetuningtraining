@@ -722,7 +722,10 @@ async def chat_stream(req: ChatRequest):
 
     return StreamingResponse(
         event_source(),
-        media_type="text/event-stream",
+        # Explicit charset=utf-8 so any browser / proxy that defaults
+        # to Latin-1 / Windows-1252 doesn't mangle em dashes or other
+        # non-ASCII glyphs into mojibake.
+        media_type="text/event-stream; charset=utf-8",
         headers={
             # Disable buffering from nginx / Vite proxy so bytes flow immediately
             "Cache-Control": "no-cache",

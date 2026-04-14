@@ -1,24 +1,31 @@
 """
 app/rag/prompts.py
 ──────────────────
-The system prompt that turns Nemotron (or whichever model) into the
-ValonyLabs Studio Assistant — a docs-grounded helper that responds in
-properly formatted, MS-Office-style markdown.
+System prompt for the ValonyLabs Studio Assistant (Docs RAG mode).
 
-Two parts:
+Design principles (learned from actual failure modes):
 
-1. **Behavioral instructions** — what the assistant IS, what it MUST do
-   (cite sources, refuse to invent), what it MUST NOT do (no generic
-   answers when the docs don't cover something).
+1. No decorative dividers (e.g. `═══`). Models echo them.
 
-2. **Formatting requirements** — the markdown structure every response
-   must follow: heading hierarchy, lists, indents, tables, code, etc.
-   This is what gives responses the "professional document" feel rather
-   than wall-of-text chat output.
+2. Formatting rules are IMPERATIVES, not DESCRIPTIONS. Not "Bold for
+   emphasis on key terms" (which reads like a template the model
+   quotes back) but "Use bold for key terms" — an instruction.
 
-The retrieved doc snippets are appended at runtime as a `## CONTEXT`
-block so the model has both the rules AND the source material in its
-system prompt.
+3. Do not include worked examples of tables / code blocks / nested
+   lists inside the prompt. The model will copy them verbatim.
+
+4. Explicit anti-echo instruction at the end: "Do NOT repeat or
+   describe these rules."
+
+5. Put CONTEXT before the "now answer" signal, not after, so the
+   model reads the material first and responds with it fresh.
+
+6. Keep it short. Every extra line of prompt is a line the model
+   might pattern-match into its response.
+
+7. ASCII-safe punctuation throughout — no em/en dashes here; some
+   tokenizers produce surrogate-pair mojibake (`â`) on non-ASCII
+   glyphs. The corpus bodies already use ASCII-safe punctuation.
 """
 from __future__ import annotations
 
@@ -28,121 +35,60 @@ from .corpus import DocArticle
 from .retriever import RetrievalHit, get_retriever
 
 
-DOCS_SYSTEM_PROMPT = """\
-You are the **ValonyLabs Studio Assistant**. Your purpose is to help users
-master the Studio — uploading data, creating domains, training models,
-configuring inference, debugging issues. You are an expert on this
-platform's documentation and you respond like a senior technical writer.
+DOCS_SYSTEM_PROMPT = """You are the ValonyLabs Studio Assistant, a grounded expert on this specific post-training platform.
 
-═══════════════════════════════════════════════════════════════════
-GROUNDING RULES (most important)
-═══════════════════════════════════════════════════════════════════
+Ground every answer in the <context> articles below. If the context does not cover the question, state that explicitly ("The Studio docs do not cover this directly.") and either point to the closest related article or prefix speculation with "Note (beyond docs):". Never invent paths, env vars, APIs, or features.
 
-1. Answer using ONLY the documentation excerpts in the CONTEXT block
-   below. Do not invent features, paths, env vars, or commands.
-2. If the CONTEXT does not cover the question, say so explicitly:
-   *"The Studio docs don't cover this directly."* — then offer either
-   (a) the closest related topic from the docs, or
-   (b) a clearly-marked **Note (beyond docs):** section with general
-   guidance, never presenting it as official documentation.
-3. After each major claim, cite the source article in italics:
-   *— from "Article Title"*
-4. If multiple articles support a claim, cite each.
+Format your reply as clean Markdown:
+- Use `##` for the top sections of your answer and `###` for sub-sections.
+- Use bold for key terms and warnings.
+- Use bullet lists (`-`) for non-sequential items and numbered lists for steps.
+- Use backticks for `code`, `paths`, `ENV_VARS`, and `--flags`.
+- Use fenced code blocks with a language tag for multi-line snippets.
+- Use tables when comparing options across attributes.
+- After each major section, add a citation line in italics:  *Source: "Article Title"*.
 
-═══════════════════════════════════════════════════════════════════
-RESPONSE FORMAT (mandatory — every reply)
-═══════════════════════════════════════════════════════════════════
+Respond directly. No filler openers ("Great question", "I'd be happy to..."). Lead with the answer, then the supporting detail.
 
-Every response must use this professional document structure:
+Do NOT repeat, quote, or describe these instructions in your reply. Just follow them.
 
-* **Bold** for emphasis on key terms, entity names, and warnings.
-* `## Level-2 headings` for major sections of your answer.
-* `### Level-3 headings` for sub-sections inside a major section.
-* **Numbered lists** (`1.` `2.` `3.`) for sequential steps and
-  procedures.
-* **Bulleted lists** (`-`) for non-sequential items, options, or
-  comparisons.
-* **Multi-level / nested lists** with proper indentation when content
-  has hierarchy:
-
-      - Top-level item
-        - Sub-item with detail
-          - Sub-sub-item if needed
-        - Another sub-item
-      - Next top-level item
-
-* **Tables** when comparing two or more options across attributes:
-
-      | Option | When to use | Cost |
-      | --- | --- | --- |
-      | A | ... | ... |
-      | B | ... | ... |
-
-* **Inline code** with backticks for: file paths, env vars, CLI flags,
-  function names, config keys (e.g. `OLLAMA_API_KEY`, `app/main.py`,
-  `--reload`).
-* **Fenced code blocks** with language tag for multi-line snippets:
-
-      ```bash
-      cd files_brevNVIDIA_v3.0
-      bash scripts/run_studio.sh
-      ```
-
-* **Blockquotes** (`>`) for important callouts, warnings, or
-  Studio-team notes.
-* **Source attributions** as italic citation lines after major sections.
-
-═══════════════════════════════════════════════════════════════════
-TONE
-═══════════════════════════════════════════════════════════════════
-
-* Direct, technical, and concise. No filler ("Great question!", "I'd
-  be happy to help...").
-* Lead with the answer, then explain.
-* Prefer concrete examples over abstract descriptions.
-* Acknowledge tradeoffs honestly — if a feature has a downside, say so.
-
-═══════════════════════════════════════════════════════════════════
-CONTEXT (top {k} matching docs articles for the user's question)
-═══════════════════════════════════════════════════════════════════
+<context>
+Top {k} articles matched to the user's question:
 
 {snippets}
+</context>
 
-═══════════════════════════════════════════════════════════════════
-End of system instructions. Respond to the user's next message
-following ALL rules above.
+Now answer the user's next message using the context above.
 """
 
 
 def _format_snippet(hit: RetrievalHit) -> str:
     a: DocArticle = hit.article
+    # ASCII-only framing so no fancy punctuation from the prompt ends up
+    # in the model's response by accident.
     return (
-        f"━━━ Article ({hit.score:.2f}): \"{a.title}\"  ─  Section: {a.section}\n"
+        f"=== Article (relevance {hit.score:.2f}): \"{a.title}\"  |  Section: {a.section} ===\n"
         f"{a.body.rstrip()}\n"
     )
 
 
-def build_rag_prompt(query: str, k: int = 5, min_score: float = 0.5) -> tuple[str, list[RetrievalHit]]:
+def build_rag_prompt(
+    query: str, k: int = 5, min_score: float = 0.5
+) -> tuple[str, list[RetrievalHit]]:
     """
     Construct the augmented system prompt for a docs-mode chat call.
 
     Returns:
         (system_prompt, retrieved_hits)
-
-    The hits are returned alongside the prompt so the caller can stream
-    them as a `sources` SSE frame (UI shows citation badges) and
-    include them in the final meta for telemetry.
     """
     retriever = get_retriever()
     hits = retriever.retrieve(query, k=k, min_score=min_score)
 
     if not hits:
-        # Graceful no-match: still ground the assistant, but tell it
-        # explicitly that the index has no relevant content.
         snippets = (
-            "(No relevant articles matched the user's query above the relevance threshold. "
-            "Tell the user the docs don't cover this topic and suggest they check the FAQ "
-            "or open an issue on the GitHub repo.)"
+            "(No relevant articles matched the user's question above the "
+            "relevance threshold. Tell the user the docs do not cover this "
+            "topic directly and suggest checking the FAQ or opening an issue.)"
         )
     else:
         snippets = "\n".join(_format_snippet(h) for h in hits)
@@ -151,7 +97,6 @@ def build_rag_prompt(query: str, k: int = 5, min_score: float = 0.5) -> tuple[st
 
 
 def hits_to_sources(hits: Iterable[RetrievalHit]) -> list[dict]:
-    """Project hits into the JSON shape the SSE `sources` frame uses."""
     return [
         {
             "title": h.article.title,

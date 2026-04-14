@@ -127,10 +127,18 @@ def test_build_rag_prompt_includes_grounding_and_format_rules():
     from app.rag import build_rag_prompt
     prompt, hits = build_rag_prompt("how do I upload a PDF?", k=3)
     assert "ValonyLabs Studio Assistant" in prompt
-    assert "GROUNDING RULES" in prompt
-    assert "RESPONSE FORMAT" in prompt
-    assert "## Level-2 headings" in prompt
-    assert "Numbered lists" in prompt
+    # The prompt must establish: identity, grounding rules, format
+    # rules, and anti-echo. Assertions intentionally match the *intent*
+    # of each section, not the exact wording, so the prompt can be
+    # tuned without breaking tests every time.
+    assert "ValonyLabs Studio Assistant" in prompt
+    assert "Ground every answer" in prompt          # grounding rule
+    assert "Never invent" in prompt                 # anti-hallucination
+    assert "Markdown" in prompt                     # format rule
+    assert "`##`" in prompt                         # heading usage
+    assert "numbered lists" in prompt.lower()       # list rule
+    assert "Do NOT repeat" in prompt                # anti-echo
+    assert "<context>" in prompt                    # context tagging
     # Snippets injected
     assert "Article" in prompt
     assert len(hits) > 0
@@ -148,7 +156,9 @@ def test_build_rag_prompt_k_truncates_to_actual_hits():
     prompt, hits = build_rag_prompt("install", k=2)
     # The prompt header references the *actual* number of returned hits,
     # not the requested k (so the model isn't told "top 5" when only 2 matched).
-    assert f"top {len(hits)}" in prompt
+    # Prompt header references the *actual* number of hits returned,
+    # not the requested k.
+    assert f"Top {len(hits)} articles" in prompt
 
 
 # ──────────────────────────────────────────────────────────────
