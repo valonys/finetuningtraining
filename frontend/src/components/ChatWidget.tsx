@@ -170,7 +170,7 @@ export default function ChatWidget() {
      swap to "base" or any trained adapter from the dropdown. */
   const [domain, setDomain] = useState(DOMAIN_DOCS);
   const [temperature, setTemperature] = useState(0.4);    // tighter for docs answers
-  const [maxTokens, setMaxTokens] = useState(800);        // larger for formatted responses
+  const [maxTokens, setMaxTokens] = useState(1500);       // generous for formatted docs replies
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);

@@ -1,6 +1,6 @@
 """
 app/rag/corpus.py
-─────────────────
+-----------------
 The Docs corpus the assistant retrieves from.
 
 Each `DocArticle` has a section, a title, an id (matches the front-end
@@ -29,11 +29,11 @@ class DocArticle:
         return f"{self.section} > {self.title}"
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 # Articles
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 ARTICLES: list[DocArticle] = [
-    # ── Getting Started ─────────────────────────────────────────────
+    # -- Getting Started ---------------------------------------------
     DocArticle(
         section="Getting Started",
         title="What is ValonyLabs Studio?",
@@ -76,7 +76,7 @@ uvicorn app.main:app --reload --port 8000
 ```bash
 cd files_brevNVIDIA_v3.0/frontend
 npm install
-npm run dev                               # → http://localhost:5173
+npm run dev                               # -> http://localhost:5173
 ```
 
 ### One-liner
@@ -104,7 +104,7 @@ Copy `.env.example` to `.env` and fill in what you need.
 """,
     ),
 
-    # ── Uploading Raw Data ──────────────────────────────────────────
+    # -- Uploading Raw Data ------------------------------------------
     DocArticle(
         section="Uploading Raw Data",
         title="Supported formats",
@@ -188,7 +188,7 @@ The build writes **two files** per dataset under `./data/processed/`:
 """,
     ),
 
-    # ── Domains ──────────────────────────────────────────────────
+    # -- Domains --------------------------------------------------
     DocArticle(
         section="Domains",
         title="What is a domain?",
@@ -249,7 +249,7 @@ copy-from-example dropdown lets you seed from an existing template.
 """,
     ),
 
-    # ── Training Methods ─────────────────────────────────────────
+    # -- Training Methods -----------------------------------------
     DocArticle(
         section="Training Methods",
         title="SFT -- Supervised Fine-Tuning",
@@ -362,7 +362,7 @@ Tell us if it's a priority for your use case.
 """,
     ),
 
-    # ── Inference & Chat ─────────────────────────────────────────
+    # -- Inference & Chat -----------------------------------------
     DocArticle(
         section="Inference & Chat",
         title="Using the chat widget",
@@ -390,7 +390,7 @@ every tab. Click the blue bubble to open it.
 
 ### Telemetry
 
-Each assistant response shows: `<backend> · <ttft>ms TTFT · <tokens> tok (<rate>/s)`.
+Each assistant response shows: `<backend> | <ttft>ms TTFT | <tokens> tok (<rate>/s)`.
 """,
     ),
     DocArticle(
@@ -422,7 +422,7 @@ Override with `VALONY_INFERENCE_BACKEND=<name>` in `.env`.
 """,
     ),
 
-    # ── Troubleshooting ──────────────────────────────────────────
+    # -- Troubleshooting ------------------------------------------
     DocArticle(
         section="Troubleshooting",
         title='"API unreachable" on the Health tab',
@@ -537,7 +537,7 @@ video) before training -- unified memory is shared.
 """,
     ),
 
-    # ── Architecture / Reference ─────────────────────────────────
+    # -- Architecture / Reference ---------------------------------
     DocArticle(
         section="Inference & Chat",
         title="Streaming chat (SSE)",
@@ -578,7 +578,7 @@ batched `/v1/chat` endpoint with those backends until then.
 ]
 
 
-# ── Convenience helpers ─────────────────────────────────────────────
+# -- Convenience helpers ---------------------------------------------
 def find_article(article_id: str) -> DocArticle | None:
     """Look up an article by its `article_id`."""
     for a in ARTICLES:
