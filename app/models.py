@@ -95,7 +95,14 @@ class ForgeBuildRequest(BaseModel):
 
 
 class ForgeBuildResponse(BaseModel):
-    output_path: str
+    output_path: str = Field(
+        description="Path to the primary JSONL dataset (one row per line). "
+                    "Loadable via `load_dataset('json', data_files=...)`."
+    )
+    preview_path: str = Field(
+        description="Path to a pretty-printed JSON file containing the first "
+                    "~10 rows of the dataset — for peeking in any editor."
+    )
     task: str
     template: str
     num_examples: int

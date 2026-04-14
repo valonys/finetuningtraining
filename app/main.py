@@ -420,14 +420,36 @@ async def forge_build(req: ForgeBuildRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    out_dir = os.path.join(req.output_dir, f"{req.task}_{os.urandom(3).hex()}")
+    # Persist in human-readable form rather than HF's binary Arrow dataset.
+    # JSONL is:
+    #   - loadable back by TRL / HF datasets via
+    #     load_dataset("json", data_files="...jsonl", split="train"),
+    #   - greppable / diffable / peekable in any editor,
+    #   - the de-facto interchange format for SFT / DPO / GRPO datasets.
+    # We also drop a pretty-printed `_preview.json` with the first 10 rows
+    # so you can sneak-peek a sample in any editor without streaming the
+    # whole file.
+    import json as _json
     os.makedirs(req.output_dir, exist_ok=True)
-    ds.save_to_disk(out_dir)
+    stem = f"{req.task}_{os.urandom(3).hex()}"
+    jsonl_path = os.path.join(req.output_dir, f"{stem}.jsonl")
+    preview_path = os.path.join(req.output_dir, f"{stem}_preview.json")
+
+    # Full dataset as JSONL (one row per line).
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for row in ds:
+            f.write(_json.dumps(row, ensure_ascii=False) + "\n")
+
+    # First 10 rows, pretty-printed, for human inspection.
+    preview_rows = [ds[i] for i in range(min(10, len(ds)))]
+    with open(preview_path, "w", encoding="utf-8") as f:
+        _json.dump(preview_rows, f, ensure_ascii=False, indent=2)
 
     from app.templates import get_template_for
     template = get_template_for(req.base_model)
     return ForgeBuildResponse(
-        output_path=out_dir,
+        output_path=jsonl_path,
+        preview_path=preview_path,
         task=req.task,
         template=template.name,
         num_examples=len(ds),

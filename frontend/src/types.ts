@@ -47,6 +47,15 @@ export interface ForgeBuildRequest {
   output_dir?: string;
 }
 
+export interface ForgeBuildResponse {
+  output_path: string;       // .jsonl — training-ready
+  preview_path: string;      // _preview.json — first 10 rows pretty-printed
+  task: string;
+  template: string;
+  num_examples: number;
+  sources: string[];
+}
+
 export interface UploadedFileInfo {
   name: string;
   path: string;
@@ -61,14 +70,6 @@ export interface UploadResponse {
 export interface UploadListResponse {
   files: UploadedFileInfo[];
   total_bytes: number;
-}
-
-export interface ForgeBuildResponse {
-  output_path: string;
-  task: string;
-  template: string;
-  num_examples: number;
-  sources: string[];
 }
 
 export interface TrainingJobRequest {

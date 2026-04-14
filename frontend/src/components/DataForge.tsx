@@ -145,8 +145,11 @@ export default function DataForge() {
       });
       setBuildResult(
         `Built ${res.task} dataset with template "${res.template}"\n` +
-        `${res.num_examples} examples from ${res.sources.length} source(s)\n` +
-        `Saved to: ${res.output_path}`
+        `${res.num_examples} examples from ${res.sources.length} source(s)\n\n` +
+        `Full dataset (JSONL, training-ready):\n  ${res.output_path}\n\n` +
+        `Human-readable preview (first 10 rows, pretty JSON):\n  ${res.preview_path}\n\n` +
+        `Peek with:\n  jq '.' < ${res.preview_path}\n` +
+        `  head -1 ${res.output_path} | jq '.'`
       );
     } catch (e) {
       setBuildResult(String(e));
