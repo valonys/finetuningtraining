@@ -108,7 +108,35 @@ class BaseAgnosticTrainer(ABC):
             subset = self.hf_dataset_cfg.get("subset")
             token = self.hf_dataset_cfg.get("token") or os.environ.get("HF_TOKEN")
             ds = load_dataset(repo, name=subset, split=split, token=token)
-            logger.info(f"📦 HF dataset: {repo} ({len(ds)} rows)")
+            total = len(ds)
+
+            # `max_samples` was documented in the HFDatasetConfig model but
+            # never actually applied — the 02_sft notebook asked for 500
+            # rows and silently got all 52k, causing OOM on laptops.
+            # `select` materialises the subset eagerly so downstream `len()`
+            # and HF map() calls see the capped size.
+            max_samples = self.hf_dataset_cfg.get("max_samples")
+            if max_samples and max_samples > 0 and total > max_samples:
+                ds = ds.select(range(max_samples))
+
+            # Remap caller-specified input/output columns into the
+            # instruction/response shape every SFT formatter can consume.
+            # Example: Alpaca ships {"instruction", "input", "output"} -- we
+            # rename "output" -> "response" so _format_dataset() picks it up.
+            in_col  = self.hf_dataset_cfg.get("input_column")
+            out_col = self.hf_dataset_cfg.get("output_column")
+            rename_map = {}
+            if in_col  and in_col  in ds.column_names and in_col  != "instruction":
+                rename_map[in_col]  = "instruction"
+            if out_col and out_col in ds.column_names and out_col != "response":
+                rename_map[out_col] = "response"
+            if rename_map:
+                ds = ds.rename_columns(rename_map)
+
+            logger.info(
+                f"📦 HF dataset: {repo} ({len(ds)}/{total} rows"
+                f"{f', capped at {max_samples}' if max_samples and total > max_samples else ''})"
+            )
             return ds
 
         if self.dataset_path is None:
