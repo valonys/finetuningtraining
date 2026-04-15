@@ -7,7 +7,7 @@ without paying for SFT first.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .base import BaseAgnosticTrainer, TrainRequest
 from .dpo_trainer import AgnosticDPOTrainer
@@ -24,6 +24,7 @@ class AgnosticORPOTrainer(BaseAgnosticTrainer):
         dataset_path: Optional[str] = None,
         hf_dataset_config: Optional[dict] = None,
         progress_callback: Optional[Callable[[float], None]] = None,
+        loss_history_sink: Optional[List[Dict[str, Any]]] = None,
     ):
         super().__init__(TrainRequest(
             config=config,
@@ -31,6 +32,7 @@ class AgnosticORPOTrainer(BaseAgnosticTrainer):
             dataset_path=dataset_path,
             hf_dataset_config=hf_dataset_config,
             progress_callback=progress_callback,
+            loss_history_sink=loss_history_sink,
         ))
 
     _format_dataset = AgnosticDPOTrainer._format_dataset   # reuse the DPO row-shape logic
@@ -65,6 +67,7 @@ class AgnosticORPOTrainer(BaseAgnosticTrainer):
             args=cfg,
             train_dataset=dataset,
             tokenizer=tokenizer,
+            callbacks=self._build_callbacks(),
         )
         result = trainer.train()
         return float(result.training_loss)

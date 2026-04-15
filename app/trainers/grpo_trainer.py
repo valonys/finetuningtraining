@@ -32,6 +32,7 @@ class AgnosticGRPOTrainer(BaseAgnosticTrainer):
         hf_dataset_config: Optional[dict] = None,
         progress_callback: Optional[Callable[[float], None]] = None,
         reward_signal: Optional[RewardSignal] = None,
+        loss_history_sink: Optional[List[Dict[str, Any]]] = None,
     ):
         super().__init__(TrainRequest(
             config=config,
@@ -39,6 +40,7 @@ class AgnosticGRPOTrainer(BaseAgnosticTrainer):
             dataset_path=dataset_path,
             hf_dataset_config=hf_dataset_config,
             progress_callback=progress_callback,
+            loss_history_sink=loss_history_sink,
         ))
         self.reward_signal: RewardSignal = reward_signal or GSM8KRewardSignal()
 
@@ -99,6 +101,7 @@ class AgnosticGRPOTrainer(BaseAgnosticTrainer):
             args=cfg,
             train_dataset=dataset,
             reward_funcs=reward_fn,
+            callbacks=self._build_callbacks(),
         )
         trainer.train()
         # GRPOTrainer doesn't always return a loss — read from state

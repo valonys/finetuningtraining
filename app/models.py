@@ -52,6 +52,11 @@ class JobStatus(BaseModel):
     samples_loaded: Optional[int] = None
     error_message: Optional[str] = None
     adapter_path: Optional[str] = None
+    # Per-step metrics captured by LossHistoryCallback. Each entry:
+    # {"step": int, "loss": float|None, "learning_rate": float|None,
+    #  "grad_norm": float|None, "epoch": float|None, "ts": float}.
+    # The UI polls /v1/jobs/{id} and renders a live loss curve from this.
+    loss_history: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 # ── Data Forge ─────────────────────────────────────────────────
@@ -83,15 +88,59 @@ class UploadResponse(BaseModel):
     )
 
 
+# ── YouTube harvester ─────────────────────────────────────────
+class YouTubeHarvestRequest(BaseModel):
+    query: str = Field(..., description="Keyword search, e.g. 'asset integrity inspection'")
+    max_videos: int = Field(default=10, ge=1, le=25)
+    min_chars: int = Field(
+        default=400,
+        description="Skip videos whose transcript is shorter than this.",
+    )
+    output_dir: str = "./data/uploads"
+
+
+class YouTubeHarvestedFile(BaseModel):
+    title: str
+    url: str
+    channel: str
+    language: str
+    auto_generated: bool
+    char_count: int
+    duration_s: int
+    file_path: str
+
+
+class YouTubeHarvestResponse(BaseModel):
+    query: str
+    max_requested: int
+    harvested: List[YouTubeHarvestedFile]
+    skipped: List[Dict[str, str]] = Field(default_factory=list)
+
+
 class ForgeBuildRequest(BaseModel):
     paths: List[str]
     task: Literal["sft", "dpo", "orpo", "kto", "grpo"] = "sft"
     base_model: str = "Qwen/Qwen2.5-7B-Instruct"
+    template: Optional[Literal[
+        "auto", "alpaca", "chatml", "deepseek", "gemma",
+        "llama2", "llama3", "mistral", "phi", "qwen", "sharegpt",
+    ]] = Field(
+        default="auto",
+        description="Chat template to apply to each row. 'auto' resolves "
+                    "from base_model. Pick an explicit name to override "
+                    "(e.g. format Llama data in Alpaca style).",
+    )
     system_prompt: str = "You are a helpful assistant."
     synth_qa: bool = True
     synth_mode: Literal["auto", "rule_based", "llm"] = "auto"
     target_size: Optional[int] = None
     output_dir: str = "./data/processed"
+    filter_noise: bool = Field(
+        default=True,
+        description="Drop TOC / cover / bibliography / digit-dense fragments "
+                    "before Q/A synthesis. Set False for full-text cases "
+                    "where every chunk is legitimately short/structured.",
+    )
 
 
 class ForgeBuildResponse(BaseModel):

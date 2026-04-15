@@ -122,14 +122,100 @@ def _clean_response(txt: str) -> str:
 # ──────────────────────────────────────────────────────────────
 # LLM-based synthesis (via SynthProvider)
 # ──────────────────────────────────────────────────────────────
-_SYNTH_INSTRUCTIONS = (
-    "From the following passage, produce {n} diverse instruction/answer pairs "
-    "suitable for supervised fine-tuning. Each pair must be self-contained — "
-    "a reader should be able to answer the instruction from the passage alone. "
-    "Vary the phrasing, difficulty, and focus across the {n} pairs. Return "
-    'strictly valid JSON in the form: {{"pairs": [{{"instruction": "...", '
-    '"response": "..."}}, ...]}}\n\nPassage:\n"""\n{chunk}\n"""'
-)
+
+# Regexes that mark a generated question as trivial metadata and
+# cause us to discard the pair post-generation. The prompt forbids
+# these too, but models will occasionally slip.
+_TRIVIAL_Q_PATTERNS = [
+    # "Who is the author / who wrote / who is the illustrator"
+    re.compile(r"\bwho\s+(?:is|was)\s+the\s+(?:author|illustrator|editor|publisher|translator)\b", re.IGNORECASE),
+    re.compile(r"\bwho\s+(?:wrote|authored|published|edited|illustrated)\b", re.IGNORECASE),
+    # "What is the title / what is the name of this book"
+    re.compile(r"\bwhat\s+is\s+the\s+(?:title|name)\s+of\s+(?:this|the)\s+(?:book|article|paper|chapter|document)\b", re.IGNORECASE),
+    # "How many chapters / sections / pages"
+    re.compile(r"\bhow\s+many\s+(?:chapters?|sections?|pages?|words?)\b", re.IGNORECASE),
+    # "When was this published / what year"
+    re.compile(r"\b(?:when\s+was|what\s+year\s+was)\s+(?:this|the)\s+(?:book|article|paper|document)\s+(?:published|written|released)\b", re.IGNORECASE),
+    # "What is the ISBN / DOI / page number"
+    re.compile(r"\bwhat\s+is\s+the\s+(?:isbn|doi|url|page\s+number)\b", re.IGNORECASE),
+    # "What does the table of contents say"
+    re.compile(r"\btable\s+of\s+contents\b", re.IGNORECASE),
+    # "What is the copyright year / who owns the copyright"
+    re.compile(r"\bcopyright\b", re.IGNORECASE),
+]
+
+# Minimum answer length (in chars) to be considered substantive.
+# Short answers ("The answer is 12.", "Yes.", "Chapter 5.") are
+# almost always trivial one-fact lookups rather than knowledge.
+_MIN_ANSWER_CHARS = 80
+
+
+_SYNTH_INSTRUCTIONS = """\
+You are generating high-quality instruction/response pairs for supervised fine-tuning.
+
+Goal: pairs that teach UNDERSTANDING, not trivia lookup. Each pair should be
+answerable from the passage alone and should read as if a domain expert were
+explaining the concept to a learner.
+
+Produce {n} diverse pairs covering DIFFERENT cognitive angles:
+
+  - **Conceptual** : "Why does X happen?"  "What is the purpose of Y?"
+  - **Procedural** : "How do you perform Z?"  "What are the steps to..."
+  - **Comparative**: "How does X differ from Y?"  "When would you prefer A over B?"
+  - **Causal**    : "What causes X?"  "What are the downstream effects of Y?"
+  - **Applied**   : "In scenario X, how would Y apply?"
+  - **Analytical* : "What does X imply about Y?"  "What does the data in X tell us?"
+
+DO NOT generate trivial metadata questions. These are EXPLICITLY FORBIDDEN:
+
+  - "Who is the author?" / "Who wrote this?"
+  - "What is the title of this book/article?"
+  - "How many chapters/sections/pages are there?"
+  - "When was this published?"
+  - "What is the ISBN / DOI / page number?"
+  - "What does the table of contents say?"
+  - "What is the copyright year?"
+
+Any pair matching the above will be REJECTED and the run will be considered
+a failure.
+
+Quality rules for each pair:
+
+  1. The RESPONSE must be at least 2-3 sentences long (roughly 80+ characters).
+     One-word or one-sentence answers are trivia; reject them.
+  2. The RESPONSE must use terminology from the passage and expand on it.
+     Do not just echo a phrase -- explain what it means and why it matters.
+  3. The INSTRUCTION must be self-contained. A reader should be able to
+     understand the question without seeing the passage.
+  4. The INSTRUCTION must not contain phrases like "in this passage",
+     "according to the text", or "as stated above" -- the pairs will be
+     used standalone in training.
+  5. Do NOT invent facts not present in the passage. Stay grounded.
+
+Passage:
+\"\"\"
+{chunk}
+\"\"\"
+
+Return strictly valid JSON only:
+
+{{"pairs": [{{"instruction": "...", "response": "..."}}, ...]}}
+"""
+
+
+def _is_trivial_question(question: str) -> bool:
+    """Return True if the question matches a known metadata-trivia pattern."""
+    return any(p.search(question) for p in _TRIVIAL_Q_PATTERNS)
+
+
+def _is_substantive_answer(answer: str) -> bool:
+    """Reject one-liners and yes/no responses as non-teaching."""
+    a = answer.strip()
+    if len(a) < _MIN_ANSWER_CHARS:
+        return False
+    # Multiple sentences OR at least one long one
+    sents = [s for s in re.split(r"[.!?]+", a) if s.strip()]
+    return len(sents) >= 2 or len(a) >= 160
 
 
 def _llm_synth(
@@ -161,16 +247,25 @@ def _llm_synth(
 
         items = _parse_pairs(content)
         for it in items[:per_chunk]:
-            if not it.get("instruction") or not it.get("response"):
+            instruction = (it.get("instruction") or "").strip()
+            response = (it.get("response") or "").strip()
+            if not instruction or not response:
+                continue
+            # Post-filter trivia the model slipped past the prompt guardrails
+            if _is_trivial_question(instruction):
+                logger.debug(f"    rejected (trivial Q): {instruction[:60]}...")
+                continue
+            if not _is_substantive_answer(response):
+                logger.debug(f"    rejected (thin A):   {response[:60]}...")
                 continue
             pairs.append({
-                "instruction": it["instruction"].strip(),
-                "response": it["response"].strip(),
+                "instruction": instruction,
+                "response": response,
                 "source": ch.get("source", ""),
                 "synth": provider.name,
             })
 
-    logger.info(f"✅ LLM synth produced {len(pairs)} pairs")
+    logger.info(f"✅ LLM synth produced {len(pairs)} pairs (post-filter)")
     return pairs
 
 

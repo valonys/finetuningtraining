@@ -39,16 +39,34 @@ class DatasetBuilder:
     target_size: Optional[int] = None
     chunk_target_chars: int = 1200
     chunk_max_chars: int = 1800
+    template_override: Optional[str] = None    # explicit template name, or None = auto
+    filter_noise: bool = True                   # skip metadata/TOC/cover chunks
 
     def build(self, records: Iterable):
         from datasets import Dataset
         from .chunker import chunk_records
         from .qa_synthesis import synthesize_qa
         from .pair_synthesis import synthesize_pairs
+        from .chunk_filter import filter_chunks
         from app.templates import get_template_for
 
-        template = get_template_for(self.base_model)
-        logger.info(f"🧩 Dataset template: {template.name} (model={self.base_model})")
+        # Template resolution:
+        #  - If `template_override` is set, use that template literally.
+        #  - Otherwise, auto-resolve from the base model id.
+        # This gives the UI a dropdown for power users who want to
+        # train, e.g., Qwen data with the Alpaca template, without
+        # having to rename the base model.
+        if self.template_override:
+            template = get_template_for(self.base_model, template=self.template_override)
+            logger.info(
+                f"🧩 Dataset template: {template.name} "
+                f"(explicit override; base model={self.base_model})"
+            )
+        else:
+            template = get_template_for(self.base_model)
+            logger.info(
+                f"🧩 Dataset template: {template.name} (auto from model={self.base_model})"
+            )
 
         # Chunk the docs
         chunks = chunk_records(
@@ -57,8 +75,27 @@ class DatasetBuilder:
             max_chars=self.chunk_max_chars,
         )
         if not chunks:
-            raise ValueError("Data Forge: no chunks produced — is the input empty?")
+            raise ValueError("Data Forge: no chunks produced -- is the input empty?")
         logger.info(f"🧱 Chunked into {len(chunks)} pieces")
+
+        # Filter noise (cover pages, TOCs, indexes, bibliography fragments,
+        # all-caps headers, digit-dense page-number strips) BEFORE Q/A
+        # synthesis. Without this, rule-based and LLM synthesis alike
+        # produce trivia like "who wrote this book?" and "how many
+        # chapters are there?" from front-matter scraps.
+        if self.filter_noise:
+            kept_chunks, stats = filter_chunks(chunks)
+            logger.info(
+                f"🧹 Noise filter: kept {len(kept_chunks)}/{len(chunks)} chunks "
+                f"(dropped: {stats['dropped_count']}, reasons: {stats['reasons']})"
+            )
+            chunks = kept_chunks
+        if not chunks:
+            raise ValueError(
+                "Data Forge: every chunk was rejected by the noise filter. "
+                "Input may be entirely metadata/TOC/index with no body text. "
+                "Disable filtering with `filter_noise=False` to bypass."
+            )
 
         # Phase 1: derive base (instruction, response) seeds from chunks
         if self.synth_qa:

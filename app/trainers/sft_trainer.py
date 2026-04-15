@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .base import BaseAgnosticTrainer, TrainRequest
 
@@ -36,6 +36,7 @@ class AgnosticSFTTrainer(BaseAgnosticTrainer):
         dataset_path: Optional[str] = None,
         hf_dataset_config: Optional[dict] = None,
         progress_callback: Optional[Callable[[float], None]] = None,
+        loss_history_sink: Optional[List[Dict[str, Any]]] = None,
     ):
         super().__init__(TrainRequest(
             config=config,
@@ -43,6 +44,7 @@ class AgnosticSFTTrainer(BaseAgnosticTrainer):
             dataset_path=dataset_path,
             hf_dataset_config=hf_dataset_config,
             progress_callback=progress_callback,
+            loss_history_sink=loss_history_sink,
         ))
 
     # ── Format dataset into a "text" column ───────────────────
@@ -144,6 +146,7 @@ class AgnosticSFTTrainer(BaseAgnosticTrainer):
             train_dataset=dataset,
             args=args,
             data_collator=data_collator,
+            callbacks=self._build_callbacks(),
         )
         result = trainer.train()
         return float(result.training_loss)

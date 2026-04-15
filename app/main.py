@@ -13,6 +13,7 @@ Endpoints
   GET  /v1/forge/uploads                 List currently-uploaded files
   DELETE /v1/forge/uploads               Clear every uploaded file
   DELETE /v1/forge/uploads/{filename}    Delete one uploaded file
+  POST /v1/forge/harvest/youtube         Keyword-search YouTube, save transcripts
 
   POST /v1/forge/ingest                  Ingest files → list of records
   POST /v1/forge/build_dataset           Ingest → normalise → HF dataset
@@ -81,6 +82,9 @@ from app.models import (
     UploadListResponse,
     UploadResponse,
     UploadedFileInfo,
+    YouTubeHarvestRequest,
+    YouTubeHarvestResponse,
+    YouTubeHarvestedFile,
 )
 from app.uploads import (
     UploadError,
@@ -381,6 +385,69 @@ async def forge_delete_upload(filename: str):
 
 
 # ──────────────────────────────────────────────────────────────
+# Data Forge — YouTube transcript harvester
+# ──────────────────────────────────────────────────────────────
+@app.post("/v1/forge/harvest/youtube", response_model=YouTubeHarvestResponse)
+async def forge_harvest_youtube(req: YouTubeHarvestRequest):
+    """
+    Keyword-search YouTube, fetch transcripts for the top N matches, and
+    write each as a plain-text file under `./data/uploads/`. After this,
+    the same file list shows up in `/v1/forge/uploads` and can be fed
+    straight into `/v1/forge/build_dataset` like any other upload.
+
+    Uses yt-dlp for search (no API key) + youtube-transcript-api for
+    captions (fast, no STT). Videos without captions are skipped and
+    listed in the response's `skipped` field.
+    """
+    try:
+        from app.harvesters.youtube import YouTubeHarvester
+    except Exception as e:
+        raise HTTPException(
+            500,
+            f"Harvester unavailable: {e}. "
+            f"Run `pip install yt-dlp youtube-transcript-api` and restart.",
+        )
+
+    try:
+        harvester = YouTubeHarvester()
+        # The yt-dlp search and transcript fetch are synchronous network
+        # calls; push them to a thread so they don't block the event loop.
+        report = await asyncio.to_thread(
+            harvester.harvest,
+            req.query,
+            max_results=req.max_videos,
+            output_dir=req.output_dir,
+            min_chars=req.min_chars,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    except Exception as e:
+        logger.exception("forge_harvest_youtube failed")
+        raise HTTPException(500, f"Harvest failed: {e}")
+
+    return YouTubeHarvestResponse(
+        query=report.query,
+        max_requested=report.max_requested,
+        harvested=[
+            YouTubeHarvestedFile(
+                title=h.title,
+                url=h.url,
+                channel=h.channel,
+                language=h.language,
+                auto_generated=h.auto_generated,
+                char_count=h.char_count,
+                duration_s=h.duration_s,
+                file_path=h.file_path,
+            )
+            for h in report.harvested
+        ],
+        skipped=report.skipped,
+    )
+
+
+# ──────────────────────────────────────────────────────────────
 # Data Forge — ingest / build
 # ──────────────────────────────────────────────────────────────
 @app.post("/v1/forge/ingest")
@@ -410,6 +477,11 @@ async def forge_build(req: ForgeBuildRequest):
     forge = DataForge()
     try:
         records = forge.ingest(req.paths)
+        # Normalise "auto" sentinel to None so the DatasetBuilder
+        # auto-resolves the template from the base model id.
+        template_override = (
+            None if not req.template or req.template == "auto" else req.template
+        )
         ds = forge.build_dataset(
             records,
             task=req.task,
@@ -418,6 +490,8 @@ async def forge_build(req: ForgeBuildRequest):
             synth_qa=req.synth_qa,
             synth_mode=req.synth_mode,
             target_size=req.target_size,
+            template_override=template_override,
+            filter_noise=req.filter_noise,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -477,6 +551,12 @@ async def _run_training(job_id: str, req: TrainingJobRequest, config: Dict[str, 
 
     def progress(p: float):
         job.progress = p
+        # Surface the most recent step's loss to the UI as it streams in
+        # -- saves the client from having to find it in loss_history.
+        if job.loss_history:
+            last = job.loss_history[-1].get("loss")
+            if last is not None:
+                job.current_loss = float(last)
 
     try:
         TrainerCls = _TRAINER_CLASSES[req.training_method]
@@ -488,6 +568,11 @@ async def _run_training(job_id: str, req: TrainingJobRequest, config: Dict[str, 
             dataset_path=req.dataset_path,
             hf_dataset_config=hf_cfg,
             progress_callback=progress,
+            # Share the JobStatus.loss_history list with the trainer so
+            # LossHistoryCallback can append per-step metrics in place.
+            # GET /v1/jobs/{id} returns the same list, giving the UI
+            # a live loss curve via simple polling.
+            loss_history_sink=job.loss_history,
         )
         result = await asyncio.to_thread(trainer.train)
 
