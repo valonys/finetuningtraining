@@ -15,8 +15,8 @@ from __future__ import annotations
 import logging
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
 
 from app.hardware import detect_hardware, resolve_profile
 from app.templates import get_template_for
@@ -32,6 +32,10 @@ class TrainRequest:
     dataset_path: Optional[str] = None
     hf_dataset_config: Optional[dict] = None
     progress_callback: Optional[Callable[[float], None]] = None
+    # Caller-supplied list receiving per-step metric dicts from
+    # LossHistoryCallback. Reference is shared with the /v1/jobs/{id}
+    # endpoint so the UI can render live loss curves.
+    loss_history_sink: Optional[List[Dict[str, Any]]] = None
 
 
 class BaseAgnosticTrainer(ABC):
@@ -44,6 +48,7 @@ class BaseAgnosticTrainer(ABC):
         self.dataset_path = req.dataset_path
         self.hf_dataset_cfg = req.hf_dataset_config
         self.progress_cb = req.progress_callback or (lambda p: None)
+        self.loss_history_sink = req.loss_history_sink
 
         self.hw = detect_hardware()
         self.profile = resolve_profile(self.hw)
@@ -131,6 +136,19 @@ class BaseAgnosticTrainer(ABC):
     def _apply_lora_if_supported(self, model):
         from .backends import apply_lora
         return apply_lora(model, profile=self.profile, backend=self.profile.training_backend)
+
+    def _build_callbacks(self) -> list:
+        """Assemble the TRL/Transformers callback list for this run.
+
+        Currently just the loss-history callback when a sink was supplied.
+        Returns an empty list when there's no sink or transformers is
+        missing, so callers can always splat it into `callbacks=...`.
+        """
+        if self.loss_history_sink is None:
+            return []
+        from .callbacks import make_loss_callback
+        cb = make_loss_callback(self.loss_history_sink)
+        return [cb] if cb is not None else []
 
     @abstractmethod
     def _format_dataset(self, dataset, tokenizer): ...

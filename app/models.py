@@ -52,6 +52,11 @@ class JobStatus(BaseModel):
     samples_loaded: Optional[int] = None
     error_message: Optional[str] = None
     adapter_path: Optional[str] = None
+    # Per-step metrics captured by LossHistoryCallback. Each entry:
+    # {"step": int, "loss": float|None, "learning_rate": float|None,
+    #  "grad_norm": float|None, "epoch": float|None, "ts": float}.
+    # The UI polls /v1/jobs/{id} and renders a live loss curve from this.
+    loss_history: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 # ── Data Forge ─────────────────────────────────────────────────

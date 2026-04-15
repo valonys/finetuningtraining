@@ -52,8 +52,14 @@ def _mock_yt_dlp_search(results: list[dict]):
 
 def _mock_transcript_api(transcripts_by_video: dict[str, str]):
     """
-    Patch youtube_transcript_api. Each video_id in transcripts_by_video
-    returns that text. Any other video_id raises NoTranscriptFound.
+    Patch youtube_transcript_api to match the v1.x instance API:
+
+        api = YouTubeTranscriptApi()
+        api.fetch(video_id, languages=[...])   # -> FetchedTranscript
+        api.list(video_id)                     # -> TranscriptList (iterable)
+
+    Each video_id in transcripts_by_video returns that text.
+    Any other video_id raises NoTranscriptFound on both fetch() and list().
     """
     err_mod = MagicMock()
     class TranscriptsDisabled(Exception): ...
@@ -63,32 +69,42 @@ def _mock_transcript_api(transcripts_by_video: dict[str, str]):
     err_mod.NoTranscriptFound = NoTranscriptFound
     err_mod.VideoUnavailable = VideoUnavailable
 
-    api_mod = MagicMock()
+    class _FakeSnippet:
+        def __init__(self, text: str):
+            self.text = text
+            self.start = 0.0
+            self.duration = 1.0
 
-    class _FakeTranscript:
-        def __init__(self, text, lang="en", is_generated=False):
-            self._text = text
+    class _FakeFetched:
+        def __init__(self, text: str, lang: str = "en", is_generated: bool = True):
+            self.snippets = [_FakeSnippet(line) for line in text.split("\n") if line.strip()]
             self.language_code = lang
             self.is_generated = is_generated
+
+    class _FakeTranscript:
+        """Matches the new Transcript object shape for api.list() results."""
+        def __init__(self, text: str, lang: str = "en"):
+            self._text = text
+            self.language_code = lang
+            self.is_translatable = False
         def fetch(self):
-            return [{"text": line} for line in self._text.split("\n") if line.strip()]
+            return _FakeFetched(self._text, self.language_code)
+        def translate(self, lang):
+            return _FakeTranscript(self._text, lang)
 
-    class _FakeListing:
-        def __init__(self, text: str):
-            self._t = _FakeTranscript(text)
-        def find_manually_created_transcript(self, langs):
-            return self._t
-        def find_generated_transcript(self, langs):
-            raise NoTranscriptFound("no auto track")
-        def __iter__(self):
-            yield self._t
+    class _FakeApi:
+        def fetch(self, vid, languages=None):
+            if vid in transcripts_by_video:
+                return _FakeFetched(transcripts_by_video[vid])
+            raise NoTranscriptFound(f"no transcript for {vid}")
 
-    def _list_transcripts(vid):
-        if vid in transcripts_by_video:
-            return _FakeListing(transcripts_by_video[vid])
-        raise NoTranscriptFound(f"no transcript for {vid}")
+        def list(self, vid):
+            if vid in transcripts_by_video:
+                return [_FakeTranscript(transcripts_by_video[vid])]
+            raise NoTranscriptFound(f"no transcript for {vid}")
 
-    api_mod.YouTubeTranscriptApi.list_transcripts.side_effect = _list_transcripts
+    api_mod = MagicMock()
+    api_mod.YouTubeTranscriptApi = _FakeApi
     return api_mod, err_mod
 
 
@@ -143,7 +159,9 @@ def test_harvest_end_to_end(tmp_path, monkeypatch):
     assert len(report.harvested) == 2
     assert len(report.skipped) == 1
     assert report.skipped[0]["title"] == "Video With No Captions"
-    assert report.skipped[0]["reason"].startswith("no transcript")
+    # Reason surfaced from the transcript-api exception — new fetch_transcript
+    # formats it as "NoTranscriptFound: no transcript for vid_003".
+    assert "no transcript" in report.skipped[0]["reason"].lower()
 
     # Files exist and have the sanitised name pattern
     for rec in report.harvested:

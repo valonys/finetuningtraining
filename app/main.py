@@ -551,6 +551,12 @@ async def _run_training(job_id: str, req: TrainingJobRequest, config: Dict[str, 
 
     def progress(p: float):
         job.progress = p
+        # Surface the most recent step's loss to the UI as it streams in
+        # -- saves the client from having to find it in loss_history.
+        if job.loss_history:
+            last = job.loss_history[-1].get("loss")
+            if last is not None:
+                job.current_loss = float(last)
 
     try:
         TrainerCls = _TRAINER_CLASSES[req.training_method]
@@ -562,6 +568,11 @@ async def _run_training(job_id: str, req: TrainingJobRequest, config: Dict[str, 
             dataset_path=req.dataset_path,
             hf_dataset_config=hf_cfg,
             progress_callback=progress,
+            # Share the JobStatus.loss_history list with the trainer so
+            # LossHistoryCallback can append per-step metrics in place.
+            # GET /v1/jobs/{id} returns the same list, giving the UI
+            # a live loss curve via simple polling.
+            loss_history_sink=job.loss_history,
         )
         result = await asyncio.to_thread(trainer.train)
 

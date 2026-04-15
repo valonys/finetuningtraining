@@ -114,6 +114,15 @@ export interface TrainingJobRequest {
   dataset_path?: string | null;
 }
 
+export interface LossHistoryEntry {
+  step: number;
+  loss: number | null;
+  learning_rate: number | null;
+  grad_norm: number | null;
+  epoch: number | null;
+  ts: number;
+}
+
 export interface JobStatus {
   job_id: string;
   status: string;
@@ -122,9 +131,11 @@ export interface JobStatus {
   backend?: string | null;
   template?: string | null;
   hardware?: string | null;
+  current_loss?: number | null;
   final_loss?: number | null;
   error_message?: string | null;
   adapter_path?: string | null;
+  loss_history?: LossHistoryEntry[];
 }
 
 export interface ChatRequest {

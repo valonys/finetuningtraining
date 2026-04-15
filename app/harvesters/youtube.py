@@ -109,6 +109,9 @@ class YouTubeHarvester:
     ):
         self.preferred_languages = preferred_languages or ["en", "en-US", "en-GB"]
         self.user_agent = user_agent
+        # Per-call: the last fetch_transcript() call stores its failure
+        # reason here so harvest() can surface it in the `skipped` report.
+        self._last_reason: Optional[str] = None
 
     # ── Public API ─────────────────────────────────────────────
     def search(self, query: str, max_results: int = 10) -> list[YouTubeSearchResult]:
@@ -168,74 +171,111 @@ class YouTubeHarvester:
         """
         Return (plain_text, language, auto_generated) for a single video,
         or None if no caption track is available in a preferred language.
+
+        Uses the youtube-transcript-api v1.x+ instance API. The v0.x
+        `YouTubeTranscriptApi.list_transcripts(video_id)` classmethod
+        was removed, so the harvester was silently failing on every
+        request. New shape:
+
+            api = YouTubeTranscriptApi()
+            tlist = api.list(video_id)           # TranscriptList
+            fetched = api.fetch(video_id,
+                                languages=[...]) # FetchedTranscript
+            for snippet in fetched.snippets:     # each has .text, .start, .duration
+                ...
         """
         try:
             from youtube_transcript_api import YouTubeTranscriptApi
+        except ImportError as e:
+            raise RuntimeError(
+                "youtube-transcript-api not installed. "
+                "Add `youtube-transcript-api>=1.0` to your env."
+            ) from e
+
+        # The library publishes individual exception classes but the path
+        # has shifted between versions. Resolve lazily + fall back to a
+        # generic `Exception` catch so the function is robust across
+        # 0.x / 1.x / future releases.
+        try:
             from youtube_transcript_api._errors import (
                 TranscriptsDisabled,
                 NoTranscriptFound,
                 VideoUnavailable,
             )
-        except ImportError as e:
-            raise RuntimeError(
-                "youtube-transcript-api not installed. "
-                "Add `youtube-transcript-api>=0.6` to your env."
-            ) from e
+            _KNOWN_ERRORS = (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable)
+        except Exception:
+            _KNOWN_ERRORS = ()
 
+        api = YouTubeTranscriptApi()
+
+        # ── Preferred-language fetch ──────────────────────────────
+        # The new .fetch() accepts an ordered `languages` list. Passing
+        # our preferred list in order means auto-generated English will
+        # be used if no human-edited English exists, without the caller
+        # doing anything special.
+        fetched = None
+        last_err: Optional[str] = None
         try:
-            listing = YouTubeTranscriptApi.list_transcripts(video_id)
-        except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
-            logger.debug(f"   no transcript for {video_id}: {e}")
-            return None
+            fetched = api.fetch(video_id, languages=list(self.preferred_languages))
+        except _KNOWN_ERRORS as e:
+            last_err = f"{type(e).__name__}: {e}"
         except Exception as e:
-            logger.warning(f"   transcript lookup failed for {video_id}: {e}")
-            return None
+            last_err = f"{type(e).__name__}: {e}"
 
-        # Prefer human-edited caption tracks in a preferred language,
-        # then auto-generated in a preferred language, then any translatable.
-        chosen = None
-        auto = False
-        for lang in self.preferred_languages:
+        # ── Fallback: list all tracks, pick ANY, translate to English if needed
+        if fetched is None:
             try:
-                chosen = listing.find_manually_created_transcript([lang])
-                auto = False
-                break
-            except Exception:
-                pass
-        if chosen is None:
-            for lang in self.preferred_languages:
-                try:
-                    chosen = listing.find_generated_transcript([lang])
-                    auto = True
-                    break
-                except Exception:
-                    pass
-        if chosen is None:
-            # Last resort: any available transcript, translated to English
-            try:
-                any_transcript = next(iter(listing))
-                chosen = any_transcript.translate("en")
-                auto = getattr(any_transcript, "is_generated", True)
-            except Exception:
+                tlist = api.list(video_id)
+            except Exception as e:
+                # Surface the real reason via an attribute so the caller
+                # can include it in the user-facing `skipped` report.
+                self._last_reason = last_err or f"{type(e).__name__}: {e}"
                 return None
 
-        try:
-            entries = chosen.fetch()
-        except Exception as e:
-            logger.warning(f"   transcript fetch failed for {video_id}: {e}")
+            # Pick the first available translatable transcript, translate
+            # to the first preferred language.
+            target_lang = self.preferred_languages[0] if self.preferred_languages else "en"
+            for t in tlist:
+                try:
+                    if getattr(t, "is_translatable", False) and t.language_code != target_lang:
+                        fetched = t.translate(target_lang).fetch()
+                    else:
+                        fetched = t.fetch()
+                    break
+                except Exception as e:
+                    last_err = f"{type(e).__name__}: {e}"
+                    continue
+
+        if fetched is None:
+            self._last_reason = last_err or "no usable transcript found"
             return None
 
+        # ── Extract plain text ────────────────────────────────────
+        # Both Transcript.fetch() and YouTubeTranscriptApi.fetch() return
+        # FetchedTranscript objects with a `.snippets` iterable. For older
+        # library versions (or translated transcripts) they may return a
+        # plain list of dicts. Handle both shapes.
+        snippets = getattr(fetched, "snippets", fetched)
         text_parts = []
-        for entry in entries:
-            t = (entry.get("text") or "").strip()
-            if t and t != "[Music]" and t != "[Applause]":
+        for snippet in snippets:
+            if hasattr(snippet, "text"):
+                t = snippet.text
+            elif isinstance(snippet, dict):
+                t = snippet.get("text", "")
+            else:
+                continue
+            t = (t or "").strip()
+            if t and t not in ("[Music]", "[Applause]", "[Laughter]"):
                 text_parts.append(t)
         if not text_parts:
+            self._last_reason = "transcript is empty after filtering marker captions"
             return None
-        text = " ".join(text_parts)
-        # Collapse double spaces + stray newline fragments
-        text = re.sub(r"\s+", " ", text).strip()
-        return text, getattr(chosen, "language_code", "en"), auto
+
+        text = re.sub(r"\s+", " ", " ".join(text_parts)).strip()
+        language = getattr(fetched, "language_code", self.preferred_languages[0])
+        auto_generated = bool(getattr(fetched, "is_generated", False))
+        self._last_reason = None
+        return text, language, auto_generated
 
     def harvest(
         self,
@@ -260,10 +300,11 @@ class YouTubeHarvester:
         for h in hits:
             result = self.fetch_transcript(h.video_id)
             if result is None:
+                reason = self._last_reason or "no transcript available"
                 report.skipped.append({
                     "title": h.title,
                     "url": h.url,
-                    "reason": "no transcript available",
+                    "reason": reason,
                 })
                 continue
             text, lang, auto = result

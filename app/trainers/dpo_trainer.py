@@ -10,7 +10,7 @@ loading, chat-template application (via registry), and hardware-aware defaults.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .base import BaseAgnosticTrainer, TrainRequest
 
@@ -28,6 +28,7 @@ class AgnosticDPOTrainer(BaseAgnosticTrainer):
         dataset_path: Optional[str] = None,
         hf_dataset_config: Optional[dict] = None,
         progress_callback: Optional[Callable[[float], None]] = None,
+        loss_history_sink: Optional[List[Dict[str, Any]]] = None,
     ):
         super().__init__(TrainRequest(
             config=config,
@@ -35,6 +36,7 @@ class AgnosticDPOTrainer(BaseAgnosticTrainer):
             dataset_path=dataset_path,
             hf_dataset_config=hf_dataset_config,
             progress_callback=progress_callback,
+            loss_history_sink=loss_history_sink,
         ))
 
     def _format_dataset(self, dataset, tokenizer):
@@ -94,6 +96,7 @@ class AgnosticDPOTrainer(BaseAgnosticTrainer):
             args=cfg,
             train_dataset=dataset,
             tokenizer=tokenizer,
+            callbacks=self._build_callbacks(),
         )
         result = trainer.train()
         return float(result.training_loss)
