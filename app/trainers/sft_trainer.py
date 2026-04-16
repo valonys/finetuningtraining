@@ -97,7 +97,25 @@ class AgnosticSFTTrainer(BaseAgnosticTrainer):
     # ── TRL path ──────────────────────────────────────────────
     def _run_trl(self, model, tokenizer, dataset) -> float:
         from trl import SFTTrainer, SFTConfig
-        from transformers import DataCollatorForCompletionOnlyLM
+
+        # `DataCollatorForCompletionOnlyLM` is a TRL class. Older transformers
+        # re-exported it for convenience but newer releases (4.45+) dropped
+        # the alias, so importing from transformers throws ImportError on
+        # current Colab runtimes. Try TRL first, fall back to transformers
+        # for legacy environments, and finally to None (we'll skip the
+        # completion-only collator and just train on the full text).
+        DataCollatorForCompletionOnlyLM = None
+        try:
+            from trl import DataCollatorForCompletionOnlyLM  # noqa: F811
+        except ImportError:
+            try:
+                from transformers import DataCollatorForCompletionOnlyLM  # noqa: F811
+            except ImportError:
+                logger.warning(
+                    "⚠️  DataCollatorForCompletionOnlyLM not found in trl or "
+                    "transformers — loss will be computed on the full sequence "
+                    "(prompt + response) instead of response-only."
+                )
 
         train_args = self.config.get("training_args", {})
         max_seq = train_args.get("max_seq_length", self.profile.max_seq_length)
@@ -131,7 +149,7 @@ class AgnosticSFTTrainer(BaseAgnosticTrainer):
         )
 
         data_collator = None
-        if self.template.response_template:
+        if self.template.response_template and DataCollatorForCompletionOnlyLM is not None:
             try:
                 data_collator = DataCollatorForCompletionOnlyLM(
                     response_template=self.template.response_template,
