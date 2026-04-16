@@ -64,6 +64,53 @@ def _load_mlx(model_id: str, profile: ResolvedProfile):
     return model, tokenizer
 
 
+def _resolve_attn_impl(prefer_flash: bool, *, force_cpu: bool) -> str | None:
+    """Pick a safe `attn_implementation` value for AutoModelForCausalLM.
+
+    The hardware profile flips `use_flash_attn=True` for any CUDA box,
+    but FA2 actually needs *both*:
+      * the `flash_attn` package importable, AND
+      * an Ampere-or-newer GPU (compute capability >= 8.0).
+
+    Colab's free T4 (Turing, cc 7.5) trips this — it gets matched as
+    `cuda_consumer` in the profile resolver, then transformers raises
+    "FlashAttention2 has been toggled on, but it cannot be used".
+
+    We probe both conditions and gracefully fall back to `sdpa` (PyTorch
+    Scaled Dot Product Attention — fast on Turing+, no extra deps) when
+    FA2 isn't viable. Returning None lets transformers auto-pick, which
+    is also fine; we pick "sdpa" explicitly so the choice is logged.
+    """
+    if not prefer_flash or force_cpu:
+        return None
+
+    # 1. Is the `flash_attn` package importable?
+    try:
+        import importlib
+        if importlib.util.find_spec("flash_attn") is None:
+            logger.info("ℹ️  flash_attn not installed — using SDPA attention instead")
+            return "sdpa"
+    except Exception:
+        return "sdpa"
+
+    # 2. Does the GPU's compute capability support FA2 (>= 8.0)?
+    try:
+        import torch
+        if torch.cuda.is_available():
+            major, _ = torch.cuda.get_device_capability(0)
+            if major < 8:
+                name = torch.cuda.get_device_name(0)
+                logger.info(
+                    f"ℹ️  GPU {name!r} (compute {major}.x) is pre-Ampere — "
+                    f"flash-attention-2 unsupported, using SDPA"
+                )
+                return "sdpa"
+    except Exception:
+        return "sdpa"
+
+    return "flash_attention_2"
+
+
 def _load_trl(
     model_id: str,
     profile: ResolvedProfile,
@@ -99,13 +146,15 @@ def _load_trl(
     elif hardware.tier == "apple_silicon":
         device_map = {"": "mps"}
 
+    attn_impl = _resolve_attn_impl(profile.use_flash_attn, force_cpu=force_cpu)
+
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         quantization_config=quant_cfg,
         torch_dtype=torch_dtype,
         device_map=device_map,
         trust_remote_code=True,
-        attn_implementation="flash_attention_2" if profile.use_flash_attn else None,
+        attn_implementation=attn_impl,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
