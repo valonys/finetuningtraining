@@ -148,14 +148,22 @@ def _load_trl(
 
     attn_impl = _resolve_attn_impl(profile.use_flash_attn, force_cpu=force_cpu)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
+    # transformers 4.46+ renamed `torch_dtype` -> `dtype` and emits a
+    # DeprecationWarning on the old name. Pick the right one by probing
+    # the from_pretrained signature so we don't pin to a transformers
+    # version. Fall back to `torch_dtype` for legacy installs.
+    import inspect as _inspect
+    _fp_params = set(_inspect.signature(AutoModelForCausalLM.from_pretrained).parameters)
+    dtype_kwarg = "dtype" if "dtype" in _fp_params else "torch_dtype"
+
+    load_kwargs = dict(
         quantization_config=quant_cfg,
-        torch_dtype=torch_dtype,
         device_map=device_map,
         trust_remote_code=True,
         attn_implementation=attn_impl,
     )
+    load_kwargs[dtype_kwarg] = torch_dtype
+    model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -196,6 +204,22 @@ def apply_lora(model, *, profile: ResolvedProfile, backend: str):
         return model
 
     from peft import LoraConfig, get_peft_model, TaskType
+
+    # 4-bit / 8-bit quantized models loaded via bitsandbytes need an extra
+    # `prepare_model_for_kbit_training` pass before LoRA: it casts the
+    # layernorms to fp32, enables gradient checkpointing reentrancy, and
+    # makes sure the input embeddings produce gradients. Without it the
+    # LoRA adapters either fail to receive gradients or the very first
+    # backward call raises "element 0 of tensors does not require grad".
+    if profile.load_in_4bit or profile.load_in_8bit:
+        try:
+            from peft import prepare_model_for_kbit_training
+            model = prepare_model_for_kbit_training(
+                model, use_gradient_checkpointing=profile.gradient_checkpointing,
+            )
+        except Exception as e:
+            logger.warning(f"⚠️  prepare_model_for_kbit_training failed: {e}")
+
     cfg = LoraConfig(
         r=profile.lora_r,
         lora_alpha=profile.lora_alpha,
