@@ -110,6 +110,8 @@ class AgnosticSFTTrainer(BaseAgnosticTrainer):
         for _import_path in (
             ("trl", "DataCollatorForCompletionOnlyLM"),
             ("trl.trainer.utils", "DataCollatorForCompletionOnlyLM"),
+            ("trl.trainer.sft_trainer", "DataCollatorForCompletionOnlyLM"),
+            ("trl.data_utils", "DataCollatorForCompletionOnlyLM"),
             ("transformers", "DataCollatorForCompletionOnlyLM"),
         ):
             try:

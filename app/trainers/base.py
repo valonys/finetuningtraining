@@ -48,7 +48,12 @@ class BaseAgnosticTrainer(ABC):
         self.dataset_path = req.dataset_path
         self.hf_dataset_cfg = req.hf_dataset_config
         self.progress_cb = req.progress_callback or (lambda p: None)
-        self.loss_history_sink = req.loss_history_sink
+        # Always have a sink so notebook callers (which don't pass one)
+        # still get a populated loss_history in the result dict for
+        # plotting. The FastAPI background task supplies its own list
+        # so /v1/jobs/{id} can stream it -- in that case we honour the
+        # caller's reference instead of allocating our own.
+        self.loss_history_sink = req.loss_history_sink if req.loss_history_sink is not None else []
 
         self.hw = detect_hardware()
         self.profile = resolve_profile(self.hw)
@@ -95,6 +100,9 @@ class BaseAgnosticTrainer(ABC):
             "samples": len(dataset),
             "final_loss": final_loss,
             "adapter_path": self.output_dir,
+            # Per-step metrics captured by LossHistoryCallback. Notebook
+            # callers can plot result["loss_history"] directly.
+            "loss_history": self.loss_history_sink,
         }
 
     # ── Pluggable phases ──────────────────────────────────────
@@ -168,12 +176,11 @@ class BaseAgnosticTrainer(ABC):
     def _build_callbacks(self) -> list:
         """Assemble the TRL/Transformers callback list for this run.
 
-        Currently just the loss-history callback when a sink was supplied.
-        Returns an empty list when there's no sink or transformers is
-        missing, so callers can always splat it into `callbacks=...`.
+        Always attaches LossHistoryCallback (the sink is guaranteed
+        non-None — see __init__). Returns an empty list when the
+        transformers backend is missing so callers can always splat
+        the result into `callbacks=...`.
         """
-        if self.loss_history_sink is None:
-            return []
         from .callbacks import make_loss_callback
         cb = make_loss_callback(self.loss_history_sink)
         return [cb] if cb is not None else []
