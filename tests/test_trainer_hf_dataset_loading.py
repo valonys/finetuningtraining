@@ -139,6 +139,43 @@ def test_output_column_gets_renamed_to_response(monkeypatch, alpaca_like_ds):
     assert ds[0]["response"] == "A0"
 
 
+def test_loss_history_sink_auto_initialised(monkeypatch, alpaca_like_ds):
+    """Notebook callers don't pass a loss_history_sink, but they still
+    need result['loss_history'] to exist for plotting. Verify the
+    trainer auto-allocates an empty list when no sink is supplied."""
+    trainer = _make_trainer(monkeypatch, alpaca_like_ds, {
+        "repo_id": "tatsu-lab/alpaca",
+        "split": "train",
+    })
+    assert trainer.loss_history_sink == []
+    assert trainer.loss_history_sink is not None
+
+
+def test_loss_history_sink_caller_reference_preserved(monkeypatch, alpaca_like_ds):
+    """The FastAPI background task passes its own list (the same one
+    /v1/jobs/{id} reads). Make sure we keep the *same* object so the
+    HTTP endpoint sees live updates -- not a fresh allocation."""
+    import app.trainers.base as base_mod
+    monkeypatch.setattr(base_mod, "detect_hardware",
+        lambda: __import__("types").SimpleNamespace(tier="cpu", effective_memory_gb=8))
+    monkeypatch.setattr(base_mod, "resolve_profile", lambda hw: __import__("types").SimpleNamespace(
+        training_backend="trl", max_seq_length=512, per_device_batch_size=1,
+        gradient_accumulation_steps=1, gradient_checkpointing=False, load_in_4bit=False,
+    ))
+    monkeypatch.setattr(base_mod, "get_template_for", lambda mid: __import__("types").SimpleNamespace(
+        name="qwen", response_template=None,
+    ))
+
+    caller_list: list = []
+    req = TrainRequest(
+        config={"domain_name": "test"},
+        base_model_id="x",
+        loss_history_sink=caller_list,
+    )
+    t = _StubTrainer(req)
+    assert t.loss_history_sink is caller_list   # same object, not a copy
+
+
 def test_input_column_gets_renamed_to_instruction(monkeypatch):
     """When upstream names the prompt `prompt`, the caller passes
     input_column='prompt' and the trainer renames it to `instruction`."""

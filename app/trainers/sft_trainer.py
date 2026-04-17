@@ -98,24 +98,34 @@ class AgnosticSFTTrainer(BaseAgnosticTrainer):
     def _run_trl(self, model, tokenizer, dataset) -> float:
         from trl import SFTTrainer, SFTConfig
 
-        # `DataCollatorForCompletionOnlyLM` is a TRL class. Older transformers
-        # re-exported it for convenience but newer releases (4.45+) dropped
-        # the alias, so importing from transformers throws ImportError on
-        # current Colab runtimes. Try TRL first, fall back to transformers
-        # for legacy environments, and finally to None (we'll skip the
-        # completion-only collator and just train on the full text).
+        # `DataCollatorForCompletionOnlyLM` is a TRL class but its import
+        # path has moved across versions:
+        #   * TRL <= 0.11:           top-level `from trl import ...`
+        #   * TRL ~ 0.12-0.15:       `from trl.trainer.utils import ...`
+        #   * TRL >= 0.16:           top-level again, sometimes removed
+        #   * Old transformers (<4.45) re-exported it for convenience.
+        # Try every known location; degrade gracefully to None and just
+        # train on the full sequence with a warning.
         DataCollatorForCompletionOnlyLM = None
-        try:
-            from trl import DataCollatorForCompletionOnlyLM  # noqa: F811
-        except ImportError:
+        for _import_path in (
+            ("trl", "DataCollatorForCompletionOnlyLM"),
+            ("trl.trainer.utils", "DataCollatorForCompletionOnlyLM"),
+            ("trl.trainer.sft_trainer", "DataCollatorForCompletionOnlyLM"),
+            ("trl.data_utils", "DataCollatorForCompletionOnlyLM"),
+            ("transformers", "DataCollatorForCompletionOnlyLM"),
+        ):
             try:
-                from transformers import DataCollatorForCompletionOnlyLM  # noqa: F811
-            except ImportError:
-                logger.warning(
-                    "⚠️  DataCollatorForCompletionOnlyLM not found in trl or "
-                    "transformers — loss will be computed on the full sequence "
-                    "(prompt + response) instead of response-only."
-                )
+                _mod = __import__(_import_path[0], fromlist=[_import_path[1]])
+                DataCollatorForCompletionOnlyLM = getattr(_mod, _import_path[1])
+                break
+            except (ImportError, AttributeError):
+                continue
+        if DataCollatorForCompletionOnlyLM is None:
+            logger.warning(
+                "⚠️  DataCollatorForCompletionOnlyLM not found in any known "
+                "location — loss will be computed on the full sequence "
+                "(prompt + response) instead of response-only."
+            )
 
         train_args = self.config.get("training_args", {})
         max_seq = train_args.get("max_seq_length", self.profile.max_seq_length)
@@ -125,10 +135,19 @@ class AgnosticSFTTrainer(BaseAgnosticTrainer):
         bs = train_args.get("batch_size", self.profile.per_device_batch_size)
         ga = train_args.get("gradient_accumulation_steps", self.profile.gradient_accumulation_steps)
 
+        import inspect
         import torch
         bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 
-        args = SFTConfig(
+        # ── Build SFTConfig kwargs defensively ────────────────────
+        # TRL has shuffled some kwargs across versions:
+        #   * `max_seq_length` was renamed to `max_length` in TRL 0.16+
+        #     (verified against current PyPI release).
+        #   * `dataset_text_field` has stayed but moved between modules.
+        # We translate renamed kwargs first, then filter to whatever the
+        # installed SFTConfig actually accepts so a version drift
+        # downgrades to a logged-and-dropped rather than TypeError.
+        wanted_cfg = dict(
             output_dir=self.output_dir,
             per_device_train_batch_size=bs,
             gradient_accumulation_steps=ga,
@@ -141,12 +160,25 @@ class AgnosticSFTTrainer(BaseAgnosticTrainer):
             bf16=bf16,
             logging_steps=5,
             save_strategy="no",
-            optim="adamw_8bit" if self.profile.load_in_4bit else "adamw_torch",
+            optim=self._pick_optim(),
             gradient_checkpointing=self.profile.gradient_checkpointing,
             max_seq_length=max_seq,
             dataset_text_field="text",
             report_to="none",
         )
+
+        cfg_params = set(inspect.signature(SFTConfig.__init__).parameters)
+
+        # TRL 0.16+: `max_seq_length` -> `max_length`. Translate before
+        # the filter so the value isn't lost.
+        if "max_seq_length" not in cfg_params and "max_length" in cfg_params:
+            wanted_cfg["max_length"] = wanted_cfg.pop("max_seq_length")
+
+        cfg_kwargs = {k: v for k, v in wanted_cfg.items() if k in cfg_params}
+        dropped = [k for k in wanted_cfg if k not in cfg_params]
+        if dropped:
+            logger.info(f"ℹ️  SFTConfig: ignoring kwargs not in this TRL version: {dropped}")
+        args = SFTConfig(**cfg_kwargs)
 
         data_collator = None
         if self.template.response_template and DataCollatorForCompletionOnlyLM is not None:
@@ -158,16 +190,41 @@ class AgnosticSFTTrainer(BaseAgnosticTrainer):
             except Exception as e:
                 logger.warning(f"⚠️  Completion-only collator unavailable: {e}")
 
-        trainer = SFTTrainer(
+        # ── Build SFTTrainer kwargs defensively ───────────────────
+        # TRL >= 0.12 renamed `tokenizer` to `processing_class`. Probe the
+        # signature so we use the right kwarg without pinning a version.
+        trainer_params = set(inspect.signature(SFTTrainer.__init__).parameters)
+        tok_kwarg = "processing_class" if "processing_class" in trainer_params else "tokenizer"
+        trainer_kwargs = dict(
             model=model,
-            tokenizer=tokenizer,
             train_dataset=dataset,
             args=args,
             data_collator=data_collator,
             callbacks=self._build_callbacks(),
         )
+        trainer_kwargs[tok_kwarg] = tokenizer
+
+        trainer = SFTTrainer(**trainer_kwargs)
         result = trainer.train()
         return float(result.training_loss)
+
+    # ── Optimizer pick ────────────────────────────────────────
+    def _pick_optim(self) -> str:
+        """Choose the safest optimizer for the current hardware/quant setup.
+
+        `adamw_8bit` requires a working bitsandbytes install AND a
+        compatible CUDA; on Colab T4 the load succeeds but the first
+        optimizer step can crash. `paged_adamw_8bit` is the more robust
+        bnb variant when 4-bit is on. For everything else, plain
+        `adamw_torch` always works.
+        """
+        if not self.profile.load_in_4bit:
+            return "adamw_torch"
+        try:
+            import bitsandbytes  # noqa: F401
+            return "paged_adamw_8bit"
+        except Exception:
+            return "adamw_torch"
 
     # ── MLX path ──────────────────────────────────────────────
     def _run_mlx(self, model, tokenizer, dataset) -> float:
