@@ -1,486 +1,332 @@
-# ValonyLabs Studio v3.0 — Agnostic Post-Training & Inference Platform
+# ValonyLabs Studio v3.0
 
-**A local, vendor-agnostic fine-tuning + inference studio in the spirit of
-[Unsloth Studio](https://unsloth.ai/docs/new/studio), runnable on:**
+**Domain-agnostic post-training, evaluation, and inference platform.**
 
-| Tier | Hardware | Training backend | Inference backend |
-|------|----------|------------------|-------------------|
-| Edge / Laptop | Apple M4 Pro (24 / 36 GB unified) | `mlx-lm` + LoRA | `mlx-lm` / `llama.cpp` |
-| Consumer GPU | NVIDIA RTX 5090 (32 GB), 4090 (24 GB) | `unsloth` + `trl` | `vllm` / `sglang` |
-| Notebook | Google Colab (T4, L4, A100) | `unsloth` + `trl` | `vllm` / HF `transformers` |
-| Cloud | NVIDIA Brev (A10G → H100), Lambda, RunPod | `unsloth` + `trl` (+ FSDP) | `vllm` / `sglang` / TRT-LLM |
-| Hosted | Ollama Cloud (Nemotron, Llama 3.3, Qwen 2.5 72B, ...) | — (catalog) | `ollama` (streaming) |
-| CPU-only | any x86/arm64 | `trl` + `peft` (tiny models) | `llama.cpp` / `transformers` |
+One-click workflow: *Collect data -> Forge dataset -> Train (SFT/DPO/ORPO/KTO/GRPO) -> Evaluate -> Deploy adapter -> Chat with RAG.*
 
-All configuration is a single `domain_config.yaml` and everything in between
-(hardware detection, template routing, trainer selection, inference engine
-selection) happens **automatically** — you only change code when you want to.
+| Tier | Hardware | Training | Inference | Status |
+|------|----------|----------|-----------|--------|
+| Consumer GPU | RTX 4090/5090 (24-32 GB) | Unsloth + TRL | vLLM / SGLang | Production |
+| Notebook | Colab T4/L4/A100 | Unsloth + TRL | HF Transformers | Tested |
+| Cloud GPU | AWS g5.xlarge (L4 24 GB) | Unsloth + TRL | vLLM | Target |
+| Apple Silicon | M1-M4 (16-96 GB unified) | MLX-LM + LoRA | MLX-LM | Supported |
+| Ollama Cloud | Nemotron, Llama 3.3, Qwen | -- (catalog) | Ollama streaming | Production |
+| CPU | Any x86/arm64 | TRL + PEFT (small models) | HF Transformers | Dev/test |
 
 ---
 
-## What's new in v3.0 (vs v2.0)
-
-| Capability | v2.0 | v3.0 |
-|------------|------|------|
-| Platforms | Brev (CUDA) only | Mac M-series · RTX 30/40/50 · Colab · Brev · CPU |
-| Training backends | Unsloth + TRL | **Unsloth · MLX-LM · TRL/PEFT (auto-routed)** |
-| Training methods | SFT · GRPO | **SFT · DPO · ORPO · KTO · GRPO · Reward modelling** |
-| Dataset formats | Local JSON/CSV · HF Hub | **+ PDF · DOCX · TXT · XLSX · PPTX · HTML · MD · Images (OCR)** |
-| OCR | — | **Tesseract · RapidOCR · PaddleOCR · Docling · TrOCR (auto-selected)** |
-| Chat templates | Alpaca-only | **Auto-detected per base model**: Alpaca · ChatML · ShareGPT · Llama-2/3 · Qwen2/2.5/3 · Mistral · Gemma · Phi · DeepSeek |
-| Inference engines | vLLM + HF fallback | **vLLM · SGLang · MLX · llama.cpp · HF (auto-routed)** |
-| TTFT optimisations | KV cache only | **KV cache · RadixAttention · prefix cache · KV-quant (FP8) · speculative decoding · chunked prefill** |
-| TTFT target | — | **20–50 ms/token (depending on tier)** |
-| Studio UI | — | **Gradio studio** (`ui/studio.py`) |
-
----
-
-## Directory layout
+## Architecture
 
 ```
-files_brevNVIDIA_v3.0/
-├── README.md                       ← you are here
-├── pyproject.toml                  ← uv / pip project
-├── requirements-cuda.txt           ← RTX / Brev / Colab
-├── requirements-mlx.txt            ← Apple Silicon
-├── requirements-cpu.txt            ← Minimal CPU fallback
-├── app/
-│   ├── main.py                     ← FastAPI server
-│   ├── models.py                   ← Pydantic schemas
-│   ├── config_loader.py            ← Domain-config loader
-│   ├── hardware/
-│   │   ├── detect.py               ← Detect CUDA / MPS / CPU, pick tier
-│   │   └── profiles.py             ← VRAM-aware defaults per tier
-│   ├── data_forge/                 ← The "Data Forge" — multi-format ingestion
-│   │   ├── ingest.py               ← Orchestrator
-│   │   ├── parsers/                ← One parser per input type
-│   │   │   ├── pdf.py              ← PyMuPDF + pdfplumber
-│   │   │   ├── docx.py             ← python-docx
-│   │   │   ├── xlsx.py             ← openpyxl / pandas
-│   │   │   ├── pptx.py             ← python-pptx
-│   │   │   ├── html.py             ← trafilatura / BS4
-│   │   │   ├── txt.py              ← encoding-sniffing plain text
-│   │   │   └── image.py            ← routes to OCR
-│   │   ├── ocr/                    ← SOTA OCR pipeline (routable)
-│   │   │   ├── base.py             ← OCR engine ABC
-│   │   │   ├── pipeline.py         ← layout → text → tables → export
-│   │   │   ├── rapidocr_engine.py  ← RapidOCR (ONNX, cross-platform)
-│   │   │   ├── paddleocr_engine.py ← PaddleOCR (CUDA / CPU)
-│   │   │   ├── docling_engine.py   ← IBM Docling (layout-aware)
-│   │   │   ├── tesseract_engine.py ← Tesseract (CPU fallback)
-│   │   │   └── trocr_engine.py     ← TrOCR (transformer, handwriting)
-│   │   ├── chunker.py              ← Semantic + structural chunking
-│   │   ├── qa_synthesis.py         ← Generate SFT Q/A pairs from docs
-│   │   └── dataset_builder.py      ← Normalise → SFT/DPO/GRPO schemas
-│   ├── templates/                  ← Chat-template registry
-│   │   ├── registry.py             ← Model-id → template resolver
-│   │   ├── alpaca.py
-│   │   ├── chatml.py
-│   │   ├── sharegpt.py
-│   │   ├── qwen.py
-│   │   ├── llama.py
-│   │   ├── mistral.py
-│   │   ├── gemma.py
-│   │   ├── phi.py
-│   │   └── deepseek.py
-│   ├── trainers/
-│   │   ├── base.py                 ← Trainer ABC
-│   │   ├── backends.py             ← Unsloth / MLX / TRL selector
-│   │   ├── sft_trainer.py
-│   │   ├── dpo_trainer.py
-│   │   ├── orpo_trainer.py
-│   │   ├── kto_trainer.py
-│   │   ├── grpo_trainer.py         ← GSM8K-style verifiable reward
-│   │   └── reward_signals.py
-│   ├── inference/
-│   │   ├── manager.py              ← Router
-│   │   ├── vllm_backend.py
-│   │   ├── sglang_backend.py
-│   │   ├── mlx_backend.py
-│   │   ├── llamacpp_backend.py
-│   │   ├── hf_backend.py
-│   │   └── cache/
-│   │       ├── prefix_cache.py     ← Cross-request cache manager
-│   │       └── kv_cache.py
-│   └── evaluation/
-│       ├── runners.py
-│       ├── metrics.py
-│       └── leaderboard.py
-├── configs/
-│   ├── domains/
-│   │   ├── _template.yaml          ← Annotated blueprint for new domains
-│   │   └── examples/               ← Seed examples (never auto-loaded)
-│   │       ├── asset_integrity.yaml
-│   │       ├── customer_grasps.yaml
-│   │       └── ai_llm.yaml
-│   ├── models/
-│   │   └── model_catalog.yaml      ← Supported base models + default template
-│   └── hardware/
-│       ├── m4_pro.yaml
-│       ├── rtx_5090.yaml
-│       ├── rtx_4090.yaml
-│       ├── colab_t4.yaml
-│       ├── brev_a10g.yaml
-│       └── brev_a100.yaml
-├── scripts/
-│   ├── install.sh                  ← Auto-detects HW, installs right stack
-│   ├── run_studio.sh               ← Launches FastAPI + Gradio
-│   └── preflight.py                ← HW check, model download, smoke test
-├── ui/
-│   └── studio.py                   ← Gradio UI
-├── notebooks/
-│   ├── 01_data_forge_demo.ipynb
-│   ├── 02_sft_qwen_alpaca.ipynb
-│   ├── 03_dpo_llama3_identity.ipynb
-│   └── 04_grpo_math_reasoning.ipynb
-├── data/
-│   ├── uploads/                    ← drop files here
-│   └── processed/                  ← normalised datasets land here
-└── outputs/                        ← adapters, merged models, logs
+frontend/            React 18 + TypeScript + Vite + Tailwind
+  src/components/
+    DataForge.tsx    Upload, YouTube harvest, dataset build
+    Train.tsx        Training knobs, live loss chart, job polling
+    TrainingChart.tsx SVG loss curve (raw + EMA smoothed)
+    ChatWidget.tsx   Floating chat with SSE streaming + Docs RAG
+    Domains.tsx      Domain config CRUD
+    Health.tsx       Hardware, backend, provider status
+
+app/                 FastAPI backend
+  main.py            API routes, job registry, SSE endpoints
+  models.py          Pydantic schemas (request/response models)
+  hardware/          Auto-detect GPU/CPU/MPS, resolve training profile
+  templates/         Chat template registry (Qwen, Llama, Alpaca, ...)
+  data_forge/        Ingest (PDF/DOCX/images), chunk, filter, Q/A synth
+  harvesters/        YouTube transcript harvester (yt-dlp + captions)
+  trainers/
+    base.py          BaseAgnosticTrainer (dataset, model, LoRA, save)
+    sft_trainer.py   SFT (TRL + MLX paths)
+    dpo_trainer.py   DPO (preference alignment)
+    orpo_trainer.py  ORPO (single-stage SFT + DPO)
+    kto_trainer.py   KTO (binary feedback)
+    grpo_trainer.py  GRPO (verifiable reward, e.g. math)
+    callbacks.py     LossHistoryCallback for live metrics
+    backends.py      Model loading (Unsloth / MLX / TRL fallback)
+    hub.py           Push adapters to HuggingFace Hub
+  inference/
+    manager.py       Backend router + LoRA hot-swap registry
+    hf_backend.py    HF Transformers (CPU/GPU, streaming)
+    ollama_backend.py Ollama Cloud / local daemon
+    vllm_backend.py  vLLM (CUDA, FP8, LoRA)
+    mlx_backend.py   MLX-LM (Apple Silicon)
+  eval/
+    scorer.py        Test-set loss, perplexity, QA accuracy
+    judge.py         LLM-as-judge (base vs adapted, win rate)
+    runner.py        Orchestrate eval + quality gate
+  rag/               BM25 retriever + Docs corpus for in-app help
+  providers/         Ollama Cloud / OpenAI / OpenRouter for Q/A synth
+
+configs/domains/     Per-engagement YAML configs
+notebooks/           Colab-ready tutorials (01-04)
+tests/               177+ unit tests, CI via GitHub Actions
 ```
 
 ---
 
-## Installation
+## Quickstart
 
-The installer auto-detects your platform and installs the matching stack.
+### Local (Mac / Linux / WSL)
 
 ```bash
-cd files_brevNVIDIA_v3.0
-bash scripts/install.sh
+git clone https://github.com/valonys/finetuningtraining.git
+cd finetuningtraining
+git checkout develop
+
+# Backend
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-cpu.txt          # or requirements-cuda.txt
+cp .env.example .env                         # edit: add OLLAMA_API_KEY
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# Frontend (separate terminal)
+cd frontend && npm install && npm run dev
 ```
 
-If you prefer manual, pick one of:
+Open http://localhost:5173.
+
+### Docker
 
 ```bash
-# Apple Silicon (M1/M2/M3/M4)
-pip install -r requirements-mlx.txt
-
-# NVIDIA GPU (RTX 30/40/50, Colab, Brev)
-pip install -r requirements-cuda.txt
+# GPU (needs nvidia-container-toolkit)
+docker compose up
 
 # CPU-only
-pip install -r requirements-cpu.txt
+docker compose --profile cpu up
 ```
+
+### Google Colab
+
+Open `notebooks/02_sft_qwen_alpaca.ipynb` in Colab. The bootstrap cell clones the repo, installs deps (including Unsloth on T4+), and sets up HF_TOKEN from Colab Secrets.
 
 ---
 
-## Synth provider — Ollama Cloud (Nemotron) by default
+## Training methods
 
-The Data Forge needs a strong LLM for two things:
+| Method | Dataset schema | When to use |
+|--------|----------------|-------------|
+| **SFT** | `{instruction, response}` or `{text}` | First-pass domain adaptation |
+| **DPO** | `{prompt, chosen, rejected}` | Preference alignment from paired feedback |
+| **ORPO** | `{prompt, chosen, rejected}` | Single-stage SFT + preference (no ref model) |
+| **KTO** | `{prompt, completion, label}` | Binary thumbs-up/down feedback |
+| **GRPO** | `{prompt, ground_truth}` | Verifiable reward (math, code tests) |
 
-1. **Q/A pair synthesis** — given a document chunk, generate diverse
-   `{instruction, response}` pairs for SFT.
-2. **Contrastive pair synthesis** — given an instruction, generate a
-   high-quality `chosen` and a plausible-but-wrong `rejected` for DPO / ORPO.
+### Training via the Studio UI
 
-Ollama Cloud (paid hosted service) running **Llama-3.1-Nemotron-70B** is
-the recommended default. It's dramatically cheaper than frontier APIs
-(OpenAI GPT-4, Anthropic Claude) and dramatically better than any local
-7B for high-volume synthetic data generation.
+1. **Domains** tab: create a domain config (system prompt + constitution).
+2. **Data Forge** tab: upload files / harvest YouTube / build dataset.
+3. **Train** tab: pick domain, model, method, dataset path. Queue job.
+4. Watch the live loss chart. The backend streams per-step metrics via `LossHistoryCallback`.
 
-### Configure (one line)
-
-```bash
-export OLLAMA_API_KEY=sk-your-ollama-cloud-key      # from ollama.com → API keys
-# Optional:
-export OLLAMA_MODEL=nemotron                        # default — or llama3.3, qwen2.5:72b, etc.
-```
-
-That's it. Once `OLLAMA_API_KEY` is set, `DataForge.build_dataset(...)`
-with `task="sft"` or `task="dpo"` will automatically route through
-Nemotron for Q/A synth and contrastive pair generation. `/healthz` reports
-the active synth provider in its response body.
-
-### Fallbacks and alternatives
-
-The provider registry (`app.providers`) auto-detects in priority order:
-
-| Env var | Provider | Default model |
-|---|---|---|
-| `OLLAMA_API_KEY` | Ollama Cloud | `nemotron` |
-| `OLLAMA_HOST` (no key) | Local Ollama daemon | `llama3.1` |
-| `OPENAI_API_KEY` | OpenAI | `gpt-4o-mini` |
-| `OPENROUTER_API_KEY` + `VALONY_SYNTH_PROVIDER=openrouter` | OpenRouter | `meta-llama/llama-3.1-70b-instruct` |
-| `VALONY_SYNTH_BASE_URL` + `VALONY_SYNTH_MODEL` | Any OpenAI-compat endpoint | *user-supplied* |
-| (nothing) | rule-based fallback | — |
-
-Force a specific provider with `VALONY_SYNTH_PROVIDER=ollama|openai|openrouter|rule_based`.
-
-See `.env.example` for a full annotated config template and
-`configs/models/model_catalog.yaml` for the curated list of synth-time
-models we recommend per domain.
-
-### Why this matters for DPO specifically
-
-The previous v2.0 DPO path used a *truncation placeholder* for the rejected
-response — training on that teaches the model "longer = better" and
-produces runaway length with no real preference signal. v3.0's
-`pair_synthesis.py` generates **real** plausible-but-wrong rejections via
-a single structured Nemotron call per prompt. That's the difference
-between a DPO dataset that ships and one that doesn't.
-
-### Serving chat from Ollama too (not just synth)
-
-Ollama can also be wired as an **inference backend**, so you can chat with
-Nemotron / Llama 3.3 / Qwen 2.5 72B directly through the Studio UI. Same
-HTTP client, just streaming instead of batch:
-
-```bash
-export OLLAMA_API_KEY=sk-your-ollama-cloud-key
-export VALONY_BASE_MODEL=nemotron             # Ollama tag, not a HF id
-export VALONY_INFERENCE_BACKEND=ollama
-bash scripts/run_studio.sh
-```
-
-**How LoRA maps on the Ollama backend** — Ollama doesn't hot-swap HF
-LoRA adapters the way vLLM / MLX / HF do. Instead, the Ollama backend
-uses `register_adapter(domain_name, ollama_tag)` to **map domain names
-to different Ollama model tags**. You get multi-domain serving without
-touching LoRA at all:
+### Training via notebooks (Colab)
 
 ```python
-from app.inference.manager import get_inference_engine
-
-engine = get_inference_engine("llama3.1", backend="ollama")
-engine.register_adapter("customer_grasps", "llama3.1")    # friendly, fast
-engine.register_adapter("asset_integrity", "qwen2.5:7b")  # technical
-engine.register_adapter("ai_llm",          "nemotron")    # Cloud-hosted
-
-# Route by domain at chat time
-engine.generate(prompt, domain_name="ai_llm")             # → nemotron
-```
-
-If you want to use a **LoRA you trained in the Studio** with the Ollama
-backend, you need to merge the adapter into the base weights, convert
-the result to GGUF, and `ollama create`/`ollama import` it into your
-local catalog. That conversion step isn't automated (yet) — for direct
-LoRA hot-swap, stick with `vllm` / `sglang` / `mlx` / `hf`.
-
----
-
-## Domains — you define them, per engagement
-
-A **domain** is anything you want the model to be. No default is hardcoded.
-You create one domain per engagement (`asset_integrity`, `customer_grasps`,
-`ai_llm`, `legal_nda_review`, `medical_intake`, `recipes`, ...) and each one
-produces its own LoRA adapter at `outputs/<domain_name>/` that can be trained,
-swapped, and served independently against any base model.
-
-`configs/domains/` ships **empty**. You create configs via any of:
-
-```bash
-# 1) CLI (argparse, no deps)
-python scripts/new_domain.py create asset_integrity \
-    --system "You are an Asset Integrity engineer specialising in FPSO inspections..." \
-    --rule  "Always prioritise safety over uptime." \
-    --rule  "Cite API 570 / ASME / ISO 55000 where relevant."
-
-# 2) Seed from a shipped example (asset_integrity / customer_grasps / ai_llm)
-python scripts/new_domain.py create my_support --copy-from customer_grasps
-
-# 3) List what's available (user configs + seed examples)
-python scripts/new_domain.py list
-```
-
-```python
-# 4) Python — from a notebook or script
-from app.config_loader import create_domain_config, domain_config_exists
-
-if not domain_config_exists("ai_llm"):
-    create_domain_config(
-        name="ai_llm",
-        system_prompt="You are a senior AI engineer specialising in LLM post-training.",
-        constitution=["Cite primary sources", "Prefer reproducible benchmarks"],
-    )
-```
-
-```bash
-# 5) REST API
-curl -X POST http://localhost:8000/v1/domains/configs \
-    -H 'content-type: application/json' \
-    -d '{
-        "name": "legal_nda_review",
-        "system_prompt": "You are a contracts attorney reviewing NDAs...",
-        "constitution": ["Flag jurisdiction clauses", "Never give legal advice"]
-    }'
-
-# List, read, template
-curl http://localhost:8000/v1/domains/configs
-curl http://localhost:8000/v1/domains/configs/legal_nda_review
-curl http://localhost:8000/v1/domains/template
-```
-
-Or use the Gradio Studio's **🏷️ Domains** tab — form-based create, a live
-preview of existing YAMLs, and dropdowns on the Train/Chat tabs that refresh
-automatically when you add a new domain.
-
-The full blueprint with explanatory comments lives at
-`configs/domains/_template.yaml`. Name validation is strict:
-`^[a-z][a-z0-9_]{0,63}$` (filesystem-safe, identifier-safe).
-
----
-
-## Quick start — Data Forge
-
-```python
-from app.data_forge.ingest import DataForge
-
-forge = DataForge()
-
-# Ingest anything — PDF, DOCX, XLSX, PPTX, HTML, images, folders...
-records = forge.ingest("./data/uploads/api_570_spec.pdf")
-
-# Build an SFT dataset with auto-generated Q/A pairs from the doc
-dataset = forge.build_dataset(
-    records,
-    task="sft",                      # "sft" | "dpo" | "grpo"
-    base_model="Qwen/Qwen2.5-7B-Instruct",  # auto-selects Qwen chat template
-    synth_qa=True,                    # synthesise Q/A pairs via an LLM
-    target_size=500,
-)
-
-dataset.save_to_disk("./data/processed/asset_integrity_sft")
-```
-
-Images are routed through the OCR pipeline (layout → text → table extraction):
-
-```python
-records = forge.ingest("./data/uploads/inspection_report.png")
-# → {"text": "...", "tables": [...], "layout": {...}, "source": "..."}
-```
-
----
-
-## Quick start — training
-
-```python
-from app.config_loader import create_domain_config, load_domain_config, domain_config_exists
-from app.trainers.sft_trainer import AgnosticSFTTrainer
-
-DOMAIN = "ai_llm"   # ← any name you like (asset_integrity, customer_grasps, legal_nda_review...)
-
-# Create the domain config on the fly if it doesn't exist yet
-if not domain_config_exists(DOMAIN):
-    create_domain_config(
-        name=DOMAIN,
-        system_prompt="You are a senior AI engineer specialising in LLM post-training.",
-        constitution=["Cite primary sources", "Prefer reproducible benchmarks"],
-    )
-
-config = load_domain_config(DOMAIN)
+from app.trainers import AgnosticSFTTrainer
 
 trainer = AgnosticSFTTrainer(
     config=config,
-    base_model_id="Qwen/Qwen2.5-7B-Instruct",
-    dataset_path=f"./data/processed/{DOMAIN}_sft",
+    base_model_id='Qwen/Qwen2.5-0.5B-Instruct',
+    dataset_path='./data/processed/my_domain_sft.jsonl',
 )
 result = trainer.train()
-print(result)   # → {adapter_path: 'outputs/ai_llm', method, backend, final_loss, ...}
+# result['loss_history'] -> list of {step, loss, learning_rate, ...}
+# result['adapter_path'] -> 'outputs/my_domain/'
 ```
 
-The trainer will:
-
-1. Detect the hardware tier (`hardware.detect`)
-2. Pick the right backend (`Unsloth` on CUDA, `MLX-LM` on Apple, `TRL+PEFT` fallback)
-3. Resolve the **chat template** from the base model ID (`templates.registry`)
-4. Format the dataset with that template automatically
-5. Pick VRAM-safe defaults (LoRA rank, seq len, batch size)
-6. Save the adapter to `outputs/{domain_name}/`
-
-Swap `AgnosticSFTTrainer` for `AgnosticDPOTrainer`, `AgnosticGRPOTrainer`,
-`AgnosticORPOTrainer`, or `AgnosticKTOTrainer` — same interface.
-
----
-
-## Quick start — inference
+### Push adapter to HuggingFace
 
 ```python
-from app.inference.manager import get_inference_engine
+from app.trainers.hub import push_adapter_to_hub
 
-engine = get_inference_engine("Qwen/Qwen2.5-7B-Instruct")
-
-# Register any trained adapter — the domain name is yours to choose
-engine.register_adapter("ai_llm",           "./outputs/ai_llm")
-engine.register_adapter("customer_grasps",  "./outputs/customer_grasps")
-engine.register_adapter("legal_nda_review", "./outputs/legal_nda_review")
-
-# Route at inference time by domain_name
-response = engine.generate(
-    prompt="Explain speculative decoding and when it helps vs. hurts.",
-    domain_name="ai_llm",
-    temperature=0.4,
-    max_new_tokens=512,
+url = push_adapter_to_hub(
+    adapter_dir=result['adapter_path'],
+    repo_id='amiguel/qwen-0.5b-my_domain-sft',
+    private=True,
+    metadata=result,
 )
 ```
 
-The manager routes to the best available backend:
+---
 
-- **vLLM** if CUDA (Ampere+) and `vllm` installed → RadixAttention + paged KV
-- **SGLang** if CUDA and `sglang[all]` installed → `sgl.gen` with prefix cache
-- **MLX-LM** if Apple Silicon and `mlx-lm` installed
-- **llama.cpp** if `llama-cpp-python` installed and a GGUF is available
-- **HF transformers** as the always-available fallback
+## Evaluation pipeline
 
-All backends share the same `generate()` interface.
+The eval module (`app/eval/`) provides automated quality gating:
+
+```python
+from app.eval import run_eval
+
+report = run_eval(
+    domain_name='ai_llm',
+    adapter_path='outputs/ai_llm/',
+    base_model_id='Qwen/Qwen2.5-0.5B-Instruct',
+    test_path='data/processed/ai_llm_sft_test.jsonl',
+    generate_base=base_fn,
+    generate_adapted=adapted_fn,
+    win_rate_threshold=0.55,
+)
+
+if report['quality_gate']['passed']:
+    push_adapter_to_hub(...)
+```
+
+### Three evaluation tiers
+
+| Tier | What it measures | Cost | Frequency |
+|------|-----------------|------|-----------|
+| **Test-set loss** | Perplexity on held-out split | Free (local compute) | Every run |
+| **QA accuracy** | Substring match on a gold Q/A bank | Free | Every run |
+| **LLM-as-judge** | Win rate: adapted vs base (Nemotron judge) | ~$0.01/prompt | Weekly |
+
+### Quality gate
+
+The runner produces `outputs/<domain>/eval_<timestamp>.json` with a pass/fail verdict. The continuous pipeline only deploys adapters that pass.
 
 ---
 
-## TTFT targets
+## Continuous training workflow
 
-Tier | Target p50 TTFT | Key optimisations
------|-----------------|------------------
-M4 Pro (MLX, 7B 4-bit) | 35–45 ms/token | MLX quant, KV cache, small model
-RTX 5090 (vLLM / SGLang, 7B FP8) | 20–30 ms/token | RadixAttention, FP8 KV, FlashAttention-3, speculative decoding
-Colab T4 (HF, 7B 4-bit) | 80–120 ms/token | bitsandbytes 4-bit, chunked prefill
-Brev A10G (vLLM, 13B FP8) | 30–45 ms/token | paged attention, continuous batching
-Brev H100 (TRT-LLM / vLLM, 70B FP8) | 15–25 ms/token | TP=2, FP8, speculative + continuous batching
+```
+Mon/Thu 02:00 UTC (EventBridge cron)
+    |
+    v
+1. COLLECT         YouTube harvester, RSS, doc uploads
+    |
+    v
+2. FORGE           Chunk + filter + synth Q/A (target=5000)
+    |
+    v
+3. TRAIN           SFT (3 epochs), optionally DPO
+    |
+    v
+4. EVAL            test_loss + QA accuracy + LLM-as-judge
+    |
+    v
+5. DEPLOY          If quality gate passes:
+                     - Push adapter to HF Hub
+                     - Hot-swap on vLLM inference
+                     - Log to model registry
+```
 
-The inference engine measures and streams p50/p90/p99 TTFT via `/healthz/latency`.
+### Scaling the dataset
 
----
-
-## Supported base models (auto-routed templates)
-
-Family | Examples | Template resolver
--------|----------|------------------
-Qwen | `Qwen/Qwen2.5-*`, `Qwen/Qwen3-*` | `qwen.QwenChatTemplate`
-Llama | `meta-llama/Llama-3.*`, `unsloth/llama-3-*` | `llama.Llama3ChatTemplate`
-Llama 2 | `meta-llama/Llama-2-*` | `llama.Llama2ChatTemplate`
-Mistral | `mistralai/Mistral-*`, `mistralai/Mixtral-*` | `mistral.MistralChatTemplate`
-Gemma | `google/gemma-*`, `google/gemma-2-*`, `google/gemma-3-*` | `gemma.GemmaChatTemplate`
-Phi | `microsoft/Phi-3-*`, `microsoft/Phi-4-*` | `phi.PhiChatTemplate`
-DeepSeek | `deepseek-ai/DeepSeek-R1-*`, `DeepSeek-V2-*` | `deepseek.DeepSeekChatTemplate`
-Generic | Alpaca, ChatML, ShareGPT | `alpaca` / `chatml` / `sharegpt`
-
-When you pick `Qwen/Qwen2.5-7B-Instruct` for SFT over a `{question, answer}`
-dataset, the pipeline **automatically** wraps each row in the Qwen ChatML
-format, applies the correct special tokens, and trains only on the response
-tokens (via `DataCollatorForCompletionOnlyLM`).
-
----
-
-## Design principles
-
-1. **Agnostic at the core** — no vendor lock-in. If a dependency is missing,
-   we fall back to a simpler one. CUDA is never assumed.
-2. **One config, many backends** — the same `domain_config.yaml` trains on
-   M4 Pro and serves on Brev without edits.
-3. **Fail loud, recover soft** — preflight checks warn early; runtime
-   fallbacks keep the UI usable.
-4. **Templates are first-class** — bad chat templates are the #1 cause of
-   silent training failure. The registry is the single source of truth.
-5. **TTFT is a metric, not a slogan** — every backend reports p50/p90/p99.
+| Source | Rows per unit | How |
+|--------|---------------|-----|
+| YouTube transcript | 50-200 Q/A pairs per video | `POST /v1/forge/harvest/youtube` |
+| PDF / DOCX | 20-100 Q/A pairs per document | Upload in Data Forge |
+| HF dataset (Alpaca, etc.) | As many as you want | `hf_dataset_config` in trainer |
+| Target size multiplier | Synth generates more Q/A per chunk | `target_size` in build_dataset |
 
 ---
 
-## Credits & references
+## API reference
 
-- Unsloth — https://github.com/unslothai/unsloth  (training speedups we mirror)
-- Unsloth Studio — https://unsloth.ai/docs/new/studio  (UX inspiration)
-- SGLang — RadixAttention, structured generation
-- vLLM — PagedAttention, continuous batching
-- HuggingFace TRL — SFT / DPO / GRPO / ORPO / KTO reference implementations
-- IBM Docling — layout-aware document parsing
-- Washington University *Intro to Post-Training* — curriculum grounding
-- *Inference Engineering* (Brev/NVIDIA) — TTFT optimisation playbook
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/healthz` | Hardware, backend, provider status |
+| GET | `/v1/templates` | Available chat templates |
+| GET | `/v1/domains/configs` | List domain configs |
+| POST | `/v1/domains/configs` | Create domain config |
+| POST | `/v1/forge/upload` | Upload files (multipart) |
+| POST | `/v1/forge/build_dataset` | Chunk + synth Q/A -> JSONL |
+| POST | `/v1/forge/harvest/youtube` | YouTube keyword -> transcripts |
+| POST | `/v1/jobs/create` | Queue a training job |
+| GET | `/v1/jobs/{id}` | Job status + live loss_history |
+| GET | `/v1/jobs` | List all jobs |
+| GET | `/v1/domains` | List trained adapters |
+| POST | `/v1/inference/reload` | Re-scan adapters |
+| POST | `/v1/chat` | Chat (batched response) |
+| POST | `/v1/chat/stream` | Chat (SSE streaming) |
+
+---
+
+## Docker deployment
+
+### Build
+
+```bash
+# CUDA (production on g5.xlarge / L4 / A100)
+docker build -t valonylabs-studio .
+
+# CPU-only (CI, dev, Fargate control plane)
+docker build -t valonylabs-studio:cpu --target cpu .
+```
+
+### Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `OLLAMA_API_KEY` | For synth | -- | Ollama Cloud key for Q/A generation |
+| `HF_TOKEN` | For gated models | -- | HuggingFace token |
+| `VALONY_BASE_MODEL` | No | `Qwen/Qwen2.5-7B-Instruct` | Base model HF id |
+| `VALONY_INFERENCE_BACKEND` | No | auto-detected | `vllm`, `hf`, `ollama`, `mlx` |
+| `VALONY_PREWARM_INFERENCE` | No | `0` | Set `1` to load model at startup |
+
+### AWS target architecture
+
+| Component | Service | Estimated cost |
+|-----------|---------|---------------|
+| Control plane (API + UI) | ECS Fargate 0.5 vCPU / 1 GB | ~$15/mo |
+| Training worker | ECS on g5.xlarge (L4 24 GB), spot | ~$4/week |
+| Inference | ECS on g5.xlarge + vLLM | ~$1.21/hr |
+| Storage | S3 (datasets, adapters, eval logs) | < $5/mo |
+| Secrets | AWS Secrets Manager | < $1/mo |
+| Scheduler | EventBridge (twice-weekly cron) | Free tier |
+
+---
+
+## Project structure
+
+```
+files_brevNVIDIA_v3.0/
+|-- app/
+|   |-- __init__.py
+|   |-- main.py                 # FastAPI app, all routes
+|   |-- models.py               # Pydantic schemas
+|   |-- config_loader.py        # YAML domain config I/O
+|   |-- hardware/               # GPU/CPU/MPS detection + profiles
+|   |-- templates/              # Chat template registry
+|   |-- data_forge/             # Ingest, chunk, filter, synth
+|   |-- harvesters/             # YouTube transcript harvester
+|   |-- trainers/               # SFT/DPO/ORPO/KTO/GRPO + hub push
+|   |-- inference/              # vLLM, HF, Ollama, MLX, llama.cpp
+|   |-- eval/                   # Scorer, LLM judge, eval runner
+|   |-- rag/                    # BM25 retriever + docs corpus
+|   |-- providers/              # Ollama Cloud, OpenAI, OpenRouter
+|-- frontend/                   # React + TypeScript + Vite
+|-- configs/domains/            # Per-engagement YAML configs
+|-- notebooks/                  # Colab tutorials (01-04)
+|-- tests/                      # 177+ unit tests
+|-- outputs/                    # Trained adapters + eval reports
+|-- data/                       # uploads/ + processed/
+|-- Dockerfile                  # Multi-stage: CPU + CUDA targets
+|-- docker-compose.yml          # Local dev with GPU or CPU profile
+|-- requirements-cpu.txt        # CPU-only deps
+|-- requirements-cuda.txt       # CUDA deps (RTX/Colab/AWS)
+|-- requirements-mlx.txt        # Apple Silicon deps
+|-- requirements-test.txt       # CI test deps
+|-- pyproject.toml              # Project metadata + optional extras
+|-- .env.example                # Environment variable reference
+|-- LICENSE                     # Apache 2.0
+```
+
+---
+
+## Testing
+
+```bash
+# Run all tests (no GPU or external API needed)
+python -m pytest
+
+# Run a specific test file
+python -m pytest tests/test_eval.py -v
+
+# CI runs automatically via GitHub Actions on push to develop/main
+```
+
+---
+
+## License
+
+Apache 2.0. See [LICENSE](LICENSE).
+
+Built by [ValonyLabs](https://github.com/valonys) with [Claude Code](https://claude.ai/claude-code).
