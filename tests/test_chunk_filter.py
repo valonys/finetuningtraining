@@ -145,3 +145,122 @@ def test_filter_chunks_returns_stats():
     assert stats["dropped_count"] == 2
     # At least one reason was recorded
     assert sum(stats["reasons"].values()) == 2
+
+
+# ── v2 academic / book noise rules ────────────────────────────────
+def test_rejects_numbered_reference_list():
+    from app.data_forge.chunk_filter import is_noise
+    refs = (
+        "[1] Vaswani, A., Shazeer, N., et al. Attention is all you need. "
+        "NeurIPS, 2017.\n"
+        "[2] Devlin, J., Chang, M.-W., et al. BERT: Pre-training of deep "
+        "bidirectional transformers. NAACL, 2019.\n"
+        "[3] Brown, T., Mann, B., et al. Language models are few-shot "
+        "learners. NeurIPS, 2020.\n"
+        "[4] Hu, E., et al. LoRA: Low-rank adaptation of large language "
+        "models. ICLR, 2022.\n"
+        "[5] Rafailov, R., et al. Direct preference optimization. "
+        "NeurIPS, 2023.\n"
+        "[6] Shao, Z., et al. DeepSeekMath: Pushing the limits of "
+        "mathematical reasoning. arXiv, 2024."
+    )
+    noisy, reason = is_noise(refs)
+    assert noisy
+    assert reason in ("bibliography", "front_matter_signature", "short_sentences")
+
+
+def test_rejects_acknowledgements_section():
+    from app.data_forge.chunk_filter import is_noise
+    ack = (
+        "Acknowledgements\n\n"
+        "This work was supported by the National Science Foundation "
+        "under grant IIS-2023456. The authors thank the anonymous "
+        "reviewers for their constructive feedback. We also thank "
+        "the compute team at XYZ Lab for providing GPU resources."
+    )
+    noisy, reason = is_noise(ack)
+    assert noisy
+    assert reason in ("acknowledgements", "front_matter_signature")
+
+
+def test_rejects_figure_caption_only_chunk():
+    from app.data_forge.chunk_filter import is_noise
+    cap = "Figure 3: Architecture of the transformer encoder-decoder model."
+    noisy, reason = is_noise(cap)
+    # Short caption is caught by too_short or figure_caption
+    assert noisy
+    assert reason in ("too_short", "figure_caption")
+
+
+def test_rejects_index_page():
+    from app.data_forge.chunk_filter import is_noise
+    idx = (
+        "attention mechanism, 42, 105, 312\n"
+        "backpropagation, 18, 23, 67\n"
+        "convolutional layers, 88, 91\n"
+        "dropout regularization, 55, 78\n"
+        "embedding dimension, 34, 102\n"
+        "feed-forward network, 43, 109\n"
+        "gradient descent, 12, 15, 29\n"
+        "hidden states, 36, 48, 110\n"
+        "inference latency, 200, 215\n"
+        "key-value cache, 188, 195, 210\n"
+        "layer normalization, 40, 44\n"
+        "multi-head attention, 42, 106"
+    )
+    noisy, reason = is_noise(idx)
+    assert noisy
+    assert reason in ("index_page", "short_sentences", "digit_dense")
+
+
+def test_rejects_citation_heavy_paragraph():
+    from app.data_forge.chunk_filter import is_noise
+    cites = (
+        "Several approaches have been proposed [1,2,3] for efficient "
+        "fine-tuning [4,5]. Recent work [6,7,8,9] builds on earlier "
+        "results [10,11] by combining LoRA [12] with quantization "
+        "[13,14,15]. Further improvements [16,17,18,19,20] demonstrate "
+        "that [21,22] the scaling laws [23,24,25] predict [26,27,28] "
+        "the optimal [29,30] configuration [31,32,33,34,35,36]."
+    )
+    noisy, reason = is_noise(cites)
+    assert noisy
+    assert reason in ("citation_cluster", "too_few_sentences", "digit_dense")
+
+
+def test_rejects_latex_artifact_chunk():
+    from app.data_forge.chunk_filter import is_noise
+    latex = (
+        "\\begin{equation}\n"
+        "\\textbf{h}_i = \\textit{Attention}(Q, K, V)\n"
+        "\\end{equation}\n"
+        "\\label{eq:attention}\n"
+        "\\ref{fig:architecture}\n"
+        "\\cite{vaswani2017attention}\n"
+        "\\section{Background}\n"
+        "\\subsection{Related Work}\n"
+        "\\begin{theorem}\n"
+        "\\end{theorem}"
+    )
+    noisy, reason = is_noise(latex)
+    assert noisy
+    assert reason in ("latex_artifacts", "short_sentences", "too_few_sentences")
+
+
+def test_keeps_academic_prose_with_occasional_citations():
+    """Real academic content with a few citations should NOT be rejected."""
+    from app.data_forge.chunk_filter import is_noise
+    content = (
+        "Reinforcement Learning from Verifiable Rewards (RLVR) is a "
+        "training paradigm where the reward signal comes from a "
+        "deterministic verifier rather than a learned reward model. "
+        "The key insight is that for domains with ground-truth answers "
+        "(mathematics, code execution, formal logic), the reward can "
+        "be computed exactly by checking the model's output against "
+        "the known solution. This eliminates reward hacking, a "
+        "persistent problem in RLHF where the policy learns to exploit "
+        "artifacts in the reward model rather than genuinely improving "
+        "response quality."
+    )
+    noisy, reason = is_noise(content)
+    assert not noisy, f"Academic prose wrongly flagged: {reason}"
