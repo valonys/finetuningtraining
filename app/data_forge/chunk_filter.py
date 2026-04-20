@@ -75,6 +75,29 @@ _FRONT_MATTER_WORDS = frozenset({
 # each line short, little connecting prose.
 _TOC_LINE_RE = re.compile(r"^\s*.{0,80}\s+\d{1,4}\s*$", re.MULTILINE)
 
+# ── New v2 patterns (arXiv / academic PDF focused) ─────────────────
+
+# Numbered reference entries: "[1] Author et al. Title..." clusters
+_NUMBERED_REF_RE = re.compile(r"^\s*\[\d{1,3}\]\s+[A-Z]", re.MULTILINE)
+
+# Figure/Table captions: "Figure 3: ..." or "Table 2.1 –"
+_FIGURE_TABLE_RE = re.compile(
+    r"^\s*(?:Fig(?:ure)?|Table)\s+\d+[\.:–\-]",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Citation clusters: text that's mostly [1,2,3] or [Author, Year] references
+_CITE_BRACKET_RE = re.compile(r"\[\d{1,3}(?:,\s*\d{1,3})*\]")
+
+# LaTeX artifacts left over from PDF extraction
+_LATEX_CMD_RE = re.compile(r"\\(?:begin|end|textbf|textit|cite|ref|label|section|subsection)\b")
+
+# Index entries: "algorithm, 42, 105, 312" or "backpropagation  see gradient"
+_INDEX_ENTRY_RE = re.compile(
+    r"^\s*[a-zA-Z][a-zA-Z\s,-]+(?:\d{1,4}(?:\s*[,–-]\s*\d{1,4})*|see\s+[a-zA-Z])",
+    re.MULTILINE,
+)
+
 
 @dataclass
 class FilterStats:
@@ -136,6 +159,63 @@ def _front_matter_word_density(text: str) -> float:
     return matches / len(words)
 
 
+def _bibliography_density(text: str) -> float:
+    """Fraction of lines that look like numbered reference entries [1], [2]..."""
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    if len(lines) < 3:
+        return 0.0
+    ref_lines = sum(1 for ln in lines if _NUMBERED_REF_RE.match(ln))
+    return ref_lines / len(lines)
+
+
+def _citation_bracket_density(text: str) -> float:
+    """Fraction of tokens that are citation brackets like [1,2,3]."""
+    words = text.split()
+    if len(words) < 10:
+        return 0.0
+    cite_chars = sum(len(m.group()) for m in _CITE_BRACKET_RE.finditer(text))
+    return cite_chars / max(len(text), 1)
+
+
+def _latex_artifact_density(text: str) -> float:
+    """Fraction of lines containing LaTeX commands."""
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    if not lines:
+        return 0.0
+    latex_lines = sum(1 for ln in lines if _LATEX_CMD_RE.search(ln))
+    return latex_lines / len(lines)
+
+
+def _figure_caption_only(text: str) -> bool:
+    """True if the chunk is essentially just figure/table captions."""
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    if len(lines) < 1 or len(lines) > 5:
+        return False
+    return all(
+        _FIGURE_TABLE_RE.match(ln) or len(ln.strip()) < 20
+        for ln in lines
+    )
+
+
+def _index_page_density(text: str) -> float:
+    """Fraction of lines that look like book-index entries."""
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    if len(lines) < 5:
+        return 0.0
+    idx_lines = sum(1 for ln in lines if _INDEX_ENTRY_RE.match(ln))
+    return idx_lines / len(lines)
+
+
+def _is_acknowledgements_section(text: str) -> bool:
+    """Detect acknowledgements sections (short, starts with the heading)."""
+    stripped = text.strip()
+    first_line = stripped.split("\n", 1)[0].lower()
+    if not re.search(r"acknowledg[ei]?ments?", first_line):
+        return False
+    # Acknowledgements sections are typically short (< 1500 chars)
+    return len(stripped) < 1500
+
+
 # ── Public API ──────────────────────────────────────────────────────
 def is_noise(chunk_text: str) -> Tuple[bool, str]:
     """
@@ -167,6 +247,25 @@ def is_noise(chunk_text: str) -> Tuple[bool, str]:
     for pattern in _PATTERNS_HARD_REJECT:
         if pattern.search(chunk_text):
             return True, "front_matter_signature"
+
+    # ── v2 academic / book noise rules ───────────────────────
+    if _bibliography_density(chunk_text) > 0.4:
+        return True, "bibliography"
+
+    if _is_acknowledgements_section(chunk_text):
+        return True, "acknowledgements"
+
+    if _figure_caption_only(chunk_text):
+        return True, "figure_caption"
+
+    if _index_page_density(chunk_text) > 0.5:
+        return True, "index_page"
+
+    if _citation_bracket_density(chunk_text) > 0.08:
+        return True, "citation_cluster"
+
+    if _latex_artifact_density(chunk_text) > 0.3:
+        return True, "latex_artifacts"
 
     return False, ""
 
