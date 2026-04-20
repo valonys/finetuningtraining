@@ -293,10 +293,10 @@ X days.
 ### Version numbering
 
 - **v3.0.x** -- bug fixes, compat patches, notebook polish (where we are now)
-- **v3.1.0** -- GGUF export + batch pipeline cron (production deployment)
+- **v3.1.0** -- GGUF export + merge pipeline + batch training cron (production deployment)
 - **v3.2.0** -- PostgreSQL memory graph + Redis cache (personalization)
-- **v3.3.0** -- Teams Bot adapter + JWT auth (enterprise integration)
-- **v3.4.0** -- Qdrant vector retriever + agentic tools (scale)
+- **v3.3.0** -- Teams Bot adapter + JWT auth + model registry (enterprise integration)
+- **v3.4.0** -- Qdrant vector retriever + agentic tools + cost monitoring (scale)
 
 ---
 
@@ -323,13 +323,14 @@ Everything in section 4 above. Studio runs end-to-end on Colab and locally. Adap
 - Load test with 10-50 concurrent users
 - Estimated time: 3-5 days
 
-### Phase 4: Teams integration (after Phase 3)
+### Phase 4: Teams integration + model registry (after Phase 3)
 
 - Bot Framework adapter (`app/integrations/teams.py`)
 - JWT auth middleware (`app/auth/`)
 - PostgreSQL + pgvector memory graph (`app/memory/`)
 - Redis semantic cache (`app/cache/`)
-- Estimated time: 2 weeks
+- **Model registry** (track adapter versions, parent datasets, eval scores, rollback) -- promoted from Phase 5 per review feedback. Essential for multi-customer deployments and safe rollback after a bad training run.
+- Estimated time: 2-3 weeks
 
 ### Phase 5: Scale and iterate (ongoing)
 
@@ -339,10 +340,280 @@ Everything in section 4 above. Studio runs end-to-end on Colab and locally. Adap
 - Agentic tools (Jira, Graph API, SQL)
 - Second RTX 5090 with tensor parallelism
 - AWS managed deployment (Terraform/CDK)
+- Cost monitoring endpoint (`/v1/cost/estimate`)
 
 ---
 
-## 10. Key decisions and rationale
+## 10. Data pipeline (end-to-end diagram)
+
+```
+                        ┌─────────────────────────────────────────┐
+                        │          DATA COLLECTION                │
+                        │  YouTube harvester  |  File upload      │
+                        │  RSS / APIs (future) | HF Hub pull      │
+                        └──────────────┬──────────────────────────┘
+                                       │
+                                       v
+                        ┌─────────────────────────────────────────┐
+                        │          DATA FORGE                     │
+                        │  Parse (PDF/DOCX/XLSX/HTML/images+OCR)  │
+                        │  Chunk (semantic, configurable size)     │
+                        │  Filter noise (TOC, metadata, digits)   │
+                        │  Synth Q/A (Ollama Cloud Nemotron)      │
+                        │  Template format (Qwen/Llama/Alpaca/..) │
+                        │  Output: .jsonl (train) + _preview.json │
+                        └──────────────┬──────────────────────────┘
+                                       │
+                          ┌────────────┴────────────┐
+                          v                         v
+                   ┌─────────────┐          ┌─────────────┐
+                   │ TRAIN SPLIT │          │ TEST SPLIT  │
+                   │  (90%)      │          │  (10%)      │
+                   └──────┬──────┘          └──────┬──────┘
+                          │                        │
+                          v                        │
+                   ┌─────────────────┐             │
+                   │ TRAIN           │             │
+                   │ SFT / DPO /    │             │
+                   │ ORPO / KTO /   │             │
+                   │ GRPO           │             │
+                   │ -> LoRA adapter│             │
+                   └──────┬─────────┘             │
+                          │                        │
+                          v                        v
+                   ┌──────────────────────────────────────┐
+                   │ EVALUATE                             │
+                   │ 1. Test-set loss + perplexity        │
+                   │ 2. QA accuracy on held-out bank      │
+                   │ 3. LLM-as-judge (base vs adapted)    │
+                   │ -> Quality gate: PASS / FAIL         │
+                   └──────────────┬───────────────────────┘
+                                  │
+                          ┌───────┴───────┐
+                          v               v
+                      (PASS)          (FAIL)
+                          │               │
+                          v               v
+                   ┌─────────────┐   Log failure,
+                   │ DEPLOY      │   keep previous
+                   │ Merge LoRA  │   adapter active
+                   │ Export GGUF │
+                   │ Push to HF  │
+                   │ Hot-swap on │
+                   │ vLLM/Ollama │
+                   └──────┬──────┘
+                          │
+                          v
+                   ┌─────────────────┐
+                   │ SERVE           │
+                   │ /v1/chat/stream │
+                   │ + Docs RAG      │
+                   │ + Memory (fut.) │
+                   └─────────────────┘
+```
+
+---
+
+## 11. LoRA merge + GGUF export pipeline
+
+LoRA adapters are lightweight (~20 MB) but can't be loaded directly into Ollama or llama.cpp. Production deployment on the RTX server via Ollama requires a **merged + quantised GGUF**.
+
+### Flow
+
+```
+1. Load base model (e.g. Qwen/Qwen2.5-7B-Instruct)
+2. Load LoRA adapter (outputs/<domain>/adapter_model.safetensors)
+3. Merge: PeftModel.merge_and_unload() -> full-weight model
+4. Save merged model to temp directory
+5. Convert to GGUF: llama.cpp/convert_hf_to_gguf.py
+6. Quantise: llama.cpp/llama-quantize <f16.gguf> <Q4_K_M.gguf> Q4_K_M
+7. Copy to Ollama models directory or create Modelfile
+8. Clean up temp merged model (reclaim disk)
+```
+
+### API surface (planned for v3.1)
+
+```python
+# app/trainers/export.py
+def merge_and_export(
+    base_model_id: str,
+    adapter_path: str,
+    output_path: str,
+    quant: str = "Q4_K_M",     # Q4_K_M, Q5_K_M, Q8_0, F16
+    llama_cpp_path: str = "~/.local/llama.cpp",
+) -> str:
+    """Merge LoRA into base weights, convert to GGUF, quantise.
+    Returns path to the final .gguf file."""
+```
+
+### Disk budget
+
+| Step | Disk used | Temporary? |
+|------|-----------|------------|
+| Base model (HF cache) | 5-14 GB | Persistent (HF cache) |
+| LoRA adapter | 20-200 MB | Persistent (outputs/) |
+| Merged model (temp) | 5-14 GB | Deleted after GGUF convert |
+| GGUF F16 | 5-14 GB | Deleted after quantise |
+| GGUF Q4_K_M | 2-5 GB | Final artifact |
+
+Peak disk: ~30 GB for a 7B model. Budget accordingly on the RTX server.
+
+---
+
+## 12. Storage requirements
+
+| Item | Dev (Mac M4 Pro) | Prod (RTX server) | Notes |
+|------|-----------------|-------------------|-------|
+| Code + deps | 2-3 GB | 2-3 GB | Same |
+| HF model cache | 20-50 GB | 50-100 GB | Grows with models used |
+| Training datasets (raw + processed) | 1-5 GB | 5-20 GB | YouTube transcripts + uploads |
+| LoRA adapter outputs | 100-500 MB | 1-5 GB | ~20 MB per adapter |
+| GGUF models | 0 (optional) | 10-30 GB | For Ollama deployment |
+| Qdrant vectors (future) | 0 | 10-50 GB | Scales with document count |
+| PostgreSQL (future) | 0 | 1-10 GB | User memory graph |
+| Eval reports | <100 MB | <500 MB | JSON, accumulates |
+
+**Recommendation:**
+- Mac M4 Pro: 512 GB SSD is sufficient
+- RTX prod server: **1 TB NVMe minimum**, 2 TB recommended
+
+---
+
+## 13. Backup and disaster recovery
+
+### Angola-specific concerns
+
+- Power grid instability (frequent outages, 2-4 hours)
+- Internet connectivity is intermittent in some regions
+- Hardware procurement lead times are 4-8 weeks
+- No local cloud region (nearest: South Africa)
+
+### Strategy
+
+| What | Where | Frequency | Restoration time |
+|------|-------|-----------|------------------|
+| Code + configs | GitHub (develop branch) | Every commit | < 15 min |
+| Trained adapters | HuggingFace Hub (amiguel/) | After each successful eval | < 10 min (git pull) |
+| GGUF production models | Second NVMe in RTX server (RAID 1) | On change | < 5 min |
+| Training datasets | S3-compatible (Backblaze B2 at $0.005/GB/mo) or local second drive | Daily | < 1 hour |
+| PostgreSQL memory graph | pg_dump to S3/Backblaze | Daily at 04:00 UTC | < 30 min |
+| Qdrant vectors | Snapshot to S3/Backblaze | Weekly | < 2 hours |
+| Eval reports (JSON) | Git (committed alongside adapters) | After each eval | < 5 min |
+
+### Power loss mitigation
+
+- **UPS**: 1500VA / 30 min runtime (enough to save checkpoint + graceful shutdown)
+- **Training checkpoints**: save every 50 steps (already supported by TRL's `save_steps`)
+- **Docker restart policy**: `restart: unless-stopped` so services come back after reboot
+- **Ollama Cloud**: synth + catalog inference are cloud-side, unaffected by local power
+
+### Cold spare plan
+
+If the RTX server dies completely:
+1. **Immediate fallback**: Colab notebooks (free T4) for training, Ollama Cloud for inference
+2. **48-hour recovery**: Order replacement parts (GPU + NVMe are standard consumer components)
+3. **Full restore**: Docker compose up on new hardware + git clone + pull adapters from HF Hub + restore PostgreSQL from Backblaze
+
+---
+
+## 14. Inference backend selection logic
+
+The `InferenceManager` in `app/inference/manager.py` selects a backend using this priority:
+
+```
+1. Explicit override: VALONY_INFERENCE_BACKEND env var
+   (ollama, vllm, sglang, mlx, llamacpp, hf)
+   |
+   v
+2. Hardware profile default:
+   - cuda_datacenter  -> vllm
+   - cuda_consumer    -> vllm (falls back to hf if no vllm install)
+   - apple_silicon    -> mlx  (falls back to hf if no mlx-lm install)
+   - rocm             -> vllm
+   - xpu              -> hf
+   - cpu              -> llamacpp (falls back to hf)
+   |
+   v
+3. Fallback chain: try each backend in order, first that initialises
+   without error wins.
+```
+
+**LoRA adapter support by backend:**
+
+| Backend | LoRA hot-swap | Format needed | Notes |
+|---------|--------------|---------------|-------|
+| vLLM | Yes (native) | PEFT safetensors | Production path on CUDA |
+| HF Transformers | Yes (PeftModel) | PEFT safetensors | Works everywhere, slow on CPU |
+| MLX | Yes (mlx-lm LoRA) | MLX format | Need conversion from PEFT |
+| Ollama | No | GGUF (merged) | Use merge + export pipeline |
+| llama.cpp | Limited | GGUF LoRA | Experimental, not recommended |
+
+---
+
+## 15. Evaluation quality gate thresholds
+
+Default thresholds (configurable per domain via `configs/domains/<name>.yaml`):
+
+| Metric | Pass | Warn | Fail | Blocks deploy? |
+|--------|------|------|------|----------------|
+| Test-set loss | < baseline + 0.05 | baseline + 0.05 to + 0.15 | > baseline + 0.15 | Yes |
+| QA exact match accuracy | > 0.70 | 0.55 to 0.70 | < 0.55 | Yes |
+| LLM-as-judge win rate | > 0.55 | 0.45 to 0.55 | < 0.45 | Warn only (not hard block) |
+| Perplexity | < 20.0 | 20.0 to 50.0 | > 50.0 | Yes |
+
+### Baseline tracking
+
+The first successful eval run for a domain establishes the **baseline**. Subsequent runs compare against it. If the new adapter is worse than baseline on hard-block metrics, the quality gate fails and the old adapter stays active.
+
+### Override per domain
+
+```yaml
+# configs/domains/ai_llm.yaml
+eval_thresholds:
+  test_loss_delta: 0.05       # max acceptable loss increase over baseline
+  qa_accuracy_min: 0.70
+  judge_win_rate_min: 0.55
+  perplexity_max: 20.0
+```
+
+---
+
+## 16. Teams integration design notes
+
+### 30-second webhook timeout
+
+Microsoft Teams sends HTTP webhooks that expect a response within 30 seconds. Our SSE streaming inference (especially on 7B+ models) can exceed this. Solution: **proactive messaging pattern**.
+
+```
+Teams webhook arrives
+    |
+    v
+Respond HTTP 202 immediately (within 1 second)
+Send typing indicator to the conversation
+    |
+    v
+Background task:
+    1. Build prompt (system prompt + memory + RAG context)
+    2. Stream inference via /v1/chat/stream internally
+    3. Buffer tokens into chunks (~5 tokens each)
+    4. Send each chunk as a proactive message update
+    5. Final message: complete response + metadata footer
+```
+
+This pattern is well-supported by the Bot Framework SDK's `ConversationReference` and `TurnContext.send_activity()` APIs. The user sees the response building up in real-time, similar to the chat widget's SSE typewriter effect.
+
+### Auth flow
+
+```
+Teams token (JWT) -> Validate signature against Microsoft keys
+    -> Extract user_id, tenant_id, display_name
+    -> Map to PostgreSQL user record
+    -> Attach to request context for memory/RLS
+```
+
+---
+
+## 17. Key decisions and rationale
 
 | Decision | Rationale |
 |----------|-----------|
