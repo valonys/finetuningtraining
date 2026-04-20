@@ -85,6 +85,11 @@ from app.models import (
     YouTubeHarvestRequest,
     YouTubeHarvestResponse,
     YouTubeHarvestedFile,
+    ArxivHarvestRequest,
+    ArxivHarvestResponse,
+    ArxivHarvestedPaperInfo,
+    CodeHarvestRequest,
+    CodeHarvestResponse,
 )
 from app.uploads import (
     UploadError,
@@ -444,6 +449,87 @@ async def forge_harvest_youtube(req: YouTubeHarvestRequest):
             for h in report.harvested
         ],
         skipped=report.skipped,
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# Data Forge — arXiv paper harvester
+# ──────────────────────────────────────────────────────────────
+@app.post("/v1/forge/harvest/arxiv", response_model=ArxivHarvestResponse)
+async def forge_harvest_arxiv(req: ArxivHarvestRequest):
+    """Search arXiv by keyword, fetch abstracts or PDFs, and save them
+    under `./data/uploads/` so the Data Forge picks them up."""
+    from app.harvesters.arxiv import ArxivHarvester
+
+    try:
+        harvester = ArxivHarvester()
+        report = await asyncio.to_thread(
+            harvester.harvest,
+            req.query,
+            max_results=req.max_papers,
+            mode=req.mode,
+            output_dir=req.output_dir,
+            min_chars=req.min_chars,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.exception("forge_harvest_arxiv failed")
+        raise HTTPException(500, f"arXiv harvest failed: {e}")
+
+    return ArxivHarvestResponse(
+        query=report.query,
+        max_requested=report.max_requested,
+        harvested=[
+            ArxivHarvestedPaperInfo(
+                arxiv_id=p.arxiv_id,
+                title=p.title,
+                authors=p.authors,
+                categories=p.categories,
+                published=p.published,
+                char_count=p.char_count,
+                file_path=p.file_path,
+                mode=p.mode,
+            )
+            for p in report.harvested
+        ],
+        skipped=report.skipped,
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# Data Forge — Code harvester
+# ──────────────────────────────────────────────────────────────
+@app.post("/v1/forge/harvest/code", response_model=CodeHarvestResponse)
+async def forge_harvest_code(req: CodeHarvestRequest):
+    """Scan a directory for .py and .ipynb files, extract SFT-ready
+    instruction/response pairs, and write a JSONL to `data/uploads/`."""
+    from app.harvesters.code import CodeHarvester
+
+    try:
+        harvester = CodeHarvester()
+        report = await asyncio.to_thread(
+            harvester.harvest_directory,
+            req.path,
+            strategy=req.strategy,
+            source_label=req.source_label,
+            min_lines=req.min_lines,
+            max_lines=req.max_lines,
+            output_dir=req.output_dir,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.exception("forge_harvest_code failed")
+        raise HTTPException(500, f"Code harvest failed: {e}")
+
+    return CodeHarvestResponse(
+        files_scanned=report.files_scanned,
+        files_skipped=report.files_skipped,
+        total_units=report.total_units,
+        output_path=report.output_path,
     )
 
 

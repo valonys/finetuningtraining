@@ -37,6 +37,35 @@ export interface DomainConfigCreate {
   overwrite?: boolean;
 }
 
+export interface ArxivHarvestRequest {
+  query: string;
+  max_papers: number;
+  mode?: "abstract" | "full";
+  min_chars?: number;
+}
+
+export interface ArxivHarvestResponse {
+  query: string;
+  max_requested: number;
+  harvested: { arxiv_id: string; title: string; authors: string; categories: string; char_count: number; file_path: string }[];
+  skipped: { title: string; arxiv_id: string; reason: string }[];
+}
+
+export interface CodeHarvestRequest {
+  path: string;
+  strategy?: "implement" | "explain" | "review" | "docstring" | "all";
+  source_label?: string;
+  min_lines?: number;
+  max_lines?: number;
+}
+
+export interface CodeHarvestResponse {
+  files_scanned: number;
+  files_skipped: number;
+  total_units: number;
+  output_path: string;
+}
+
 export interface ForgeBuildRequest {
   paths: string[];
   task: string;
