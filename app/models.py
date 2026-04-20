@@ -117,6 +117,53 @@ class YouTubeHarvestResponse(BaseModel):
     skipped: List[Dict[str, str]] = Field(default_factory=list)
 
 
+# ── arXiv harvester ──────────────────────────────────────────
+class ArxivHarvestRequest(BaseModel):
+    query: str = Field(..., description="Keyword search, e.g. 'GRPO reinforcement learning'")
+    max_papers: int = Field(default=20, ge=1, le=100)
+    mode: Literal["abstract", "full"] = Field(
+        default="abstract",
+        description="'abstract' writes .txt files; 'full' downloads PDFs.",
+    )
+    min_chars: int = Field(default=200, description="Skip papers with shorter abstracts.")
+    output_dir: str = "./data/uploads"
+
+
+class ArxivHarvestedPaperInfo(BaseModel):
+    arxiv_id: str
+    title: str
+    authors: str
+    categories: str
+    published: str
+    char_count: int
+    file_path: str
+    mode: str
+
+
+class ArxivHarvestResponse(BaseModel):
+    query: str
+    max_requested: int
+    harvested: List[ArxivHarvestedPaperInfo]
+    skipped: List[Dict[str, str]] = Field(default_factory=list)
+
+
+# ── Code harvester ───────────────────────────────────────────
+class CodeHarvestRequest(BaseModel):
+    path: str = Field(..., description="Directory to scan for .py and .ipynb files")
+    strategy: Literal["implement", "explain", "review", "docstring", "all"] = "implement"
+    source_label: str = Field(default="", description="Label for provenance, e.g. 'Manning/Reasoning'")
+    min_lines: int = Field(default=5, ge=1)
+    max_lines: int = Field(default=200, ge=10)
+    output_dir: str = "./data/uploads"
+
+
+class CodeHarvestResponse(BaseModel):
+    files_scanned: int
+    files_skipped: int
+    total_units: int
+    output_path: str
+
+
 class ForgeBuildRequest(BaseModel):
     paths: List[str]
     task: Literal["sft", "dpo", "orpo", "kto", "grpo"] = "sft"

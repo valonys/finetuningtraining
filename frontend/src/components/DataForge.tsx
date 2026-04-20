@@ -63,6 +63,19 @@ export default function DataForge() {
   const [ytMaxVideos, setYtMaxVideos] = useState(10);
   const [harvesting, setHarvesting] = useState(false);
   const [harvestResult, setHarvestResult] = useState<string | null>(null);
+  /* arXiv harvester form */
+  const [arxivQuery, setArxivQuery] = useState("");
+  const [arxivMax, setArxivMax] = useState(20);
+  const [arxivHarvesting, setArxivHarvesting] = useState(false);
+  const [arxivResult, setArxivResult] = useState<string | null>(null);
+
+  /* Code harvester form */
+  const [codePath, setCodePath] = useState("");
+  const [codeStrategy, setCodeStrategy] = useState("implement");
+  const [codeLabel, setCodeLabel] = useState("");
+  const [codeHarvesting, setCodeHarvesting] = useState(false);
+  const [codeResult, setCodeResult] = useState<string | null>(null);
+
   const [sysPrompt, setSysPrompt] = useState("You are a helpful assistant.");
   const [synthQa, setSynthQa] = useState(true);
   const [targetSize, setTargetSize] = useState(500);
@@ -346,6 +359,145 @@ export default function DataForge() {
         {harvestResult && (
           <pre className="bg-gray-50 border rounded p-3 text-xs font-mono whitespace-pre-wrap max-h-72 overflow-y-auto">
             {harvestResult}
+          </pre>
+        )}
+      </div>
+
+      {/* ── arXiv harvester ─────────────────────────── */}
+      <div className="bg-white border rounded-lg p-5 space-y-3">
+        <h3 className="font-semibold flex items-center gap-2">
+          <span className="text-lg">📄</span> Harvest papers from arXiv
+        </h3>
+        <p className="text-xs text-gray-500">
+          Keyword search against the arXiv API. Each paper's abstract lands as a <code className="bg-gray-100 px-1 rounded">.txt</code> file
+          under <code className="bg-gray-100 px-1 rounded">./data/uploads/</code> with a provenance header, ready to be built into a dataset.
+        </p>
+        <div className="flex gap-3 items-end">
+          <label className="block text-sm flex-1">
+            <span className="text-gray-600 font-medium">Keyword query</span>
+            <input
+              className="mt-1 block w-full rounded border px-3 py-2 text-sm"
+              placeholder="e.g. GRPO reinforcement learning"
+              value={arxivQuery}
+              onChange={(e) => setArxivQuery(e.target.value)}
+            />
+          </label>
+          <label className="block text-sm">
+            <span className="text-gray-600 font-medium">Max papers</span>
+            <input
+              type="number" min={1} max={100}
+              className="mt-1 block w-24 rounded border px-3 py-2 text-sm"
+              value={arxivMax}
+              onChange={(e) => setArxivMax(Number(e.target.value))}
+            />
+          </label>
+        </div>
+        <button
+          onClick={async () => {
+            if (!arxivQuery.trim()) return;
+            setArxivHarvesting(true); setArxivResult(null);
+            try {
+              const { forgeHarvestArxiv } = await import("../api");
+              const res = await forgeHarvestArxiv({ query: arxivQuery.trim(), max_papers: arxivMax });
+              const lines = [`Harvested ${res.harvested.length} of ${res.max_requested} papers for "${res.query}".`];
+              if (res.harvested.length) {
+                lines.push("", "Papers:");
+                res.harvested.forEach(p => lines.push(`  + ${p.title.slice(0, 70)}  (${p.char_count} chars)`));
+              }
+              if (res.skipped.length) {
+                lines.push("", `Skipped (${res.skipped.length}):`);
+                res.skipped.forEach(s => lines.push(`  - ${s.title || s.arxiv_id}: ${s.reason}`));
+              }
+              lines.push("", "Refresh the Uploaded files list below to see the new .txt files.");
+              setArxivResult(lines.join("\n"));
+              refresh();
+            } catch (e) { setArxivResult(String(e)); }
+            finally { setArxivHarvesting(false); }
+          }}
+          disabled={arxivHarvesting || !arxivQuery.trim()}
+          className="btn-primary"
+        >
+          {arxivHarvesting ? "Harvesting papers..." : "Harvest from arXiv"}
+        </button>
+        {arxivResult && (
+          <pre className="bg-gray-50 border rounded p-3 text-xs font-mono whitespace-pre-wrap max-h-72 overflow-y-auto">
+            {arxivResult}
+          </pre>
+        )}
+      </div>
+
+      {/* ── Code harvester ────────────────────────────── */}
+      <div className="bg-white border rounded-lg p-5 space-y-3">
+        <h3 className="font-semibold flex items-center gap-2">
+          <span className="text-lg">🐍</span> Harvest code from a local repo
+        </h3>
+        <p className="text-xs text-gray-500">
+          Scan a directory for <code className="bg-gray-100 px-1 rounded">.py</code> and <code className="bg-gray-100 px-1 rounded">.ipynb</code> files.
+          Functions are extracted via AST parsing; notebooks pair markdown cells with code cells into natural instruction/response pairs.
+          Output is a single <code className="bg-gray-100 px-1 rounded">.jsonl</code> ready for SFT training.
+        </p>
+        <div className="flex gap-3 items-end flex-wrap">
+          <label className="block text-sm flex-1 min-w-[200px]">
+            <span className="text-gray-600 font-medium">Directory path</span>
+            <input
+              className="mt-1 block w-full rounded border px-3 py-2 text-sm font-mono"
+              placeholder="./data/manning/reasoning-from-scratch-main"
+              value={codePath}
+              onChange={(e) => setCodePath(e.target.value)}
+            />
+          </label>
+          <label className="block text-sm">
+            <span className="text-gray-600 font-medium">Strategy</span>
+            <select
+              className="mt-1 block w-36 rounded border px-3 py-2 text-sm"
+              value={codeStrategy}
+              onChange={(e) => setCodeStrategy(e.target.value)}
+            >
+              <option value="implement">Implement</option>
+              <option value="explain">Explain</option>
+              <option value="review">Review</option>
+              <option value="docstring">Docstring</option>
+              <option value="all">All (4x rows)</option>
+            </select>
+          </label>
+          <label className="block text-sm">
+            <span className="text-gray-600 font-medium">Source label</span>
+            <input
+              className="mt-1 block w-48 rounded border px-3 py-2 text-sm"
+              placeholder="Manning/Reasoning"
+              value={codeLabel}
+              onChange={(e) => setCodeLabel(e.target.value)}
+            />
+          </label>
+        </div>
+        <button
+          onClick={async () => {
+            if (!codePath.trim()) return;
+            setCodeHarvesting(true); setCodeResult(null);
+            try {
+              const { forgeHarvestCode } = await import("../api");
+              const res = await forgeHarvestCode({
+                path: codePath.trim(),
+                strategy: codeStrategy,
+                source_label: codeLabel,
+              });
+              setCodeResult(
+                `Scanned ${res.files_scanned} files, extracted ${res.total_units} units.\n` +
+                `Output: ${res.output_path}\n\n` +
+                `Refresh the Uploaded files list below to see the JSONL.`
+              );
+              refresh();
+            } catch (e) { setCodeResult(String(e)); }
+            finally { setCodeHarvesting(false); }
+          }}
+          disabled={codeHarvesting || !codePath.trim()}
+          className="btn-primary"
+        >
+          {codeHarvesting ? "Scanning code..." : "Harvest code"}
+        </button>
+        {codeResult && (
+          <pre className="bg-gray-50 border rounded p-3 text-xs font-mono whitespace-pre-wrap max-h-72 overflow-y-auto">
+            {codeResult}
           </pre>
         )}
       </div>

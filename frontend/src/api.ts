@@ -121,6 +121,27 @@ export function forgeUpload(
   });
 }
 
+export const forgeHarvestArxiv = (body: {
+  query: string;
+  max_papers: number;
+  mode?: string;
+  min_chars?: number;
+}) =>
+  call<import("./types").ArxivHarvestResponse>(
+    "/v1/forge/harvest/arxiv",
+    { method: "POST", body: JSON.stringify(body) }
+  );
+
+export const forgeHarvestCode = (body: {
+  path: string;
+  strategy?: string;
+  source_label?: string;
+}) =>
+  call<import("./types").CodeHarvestResponse>(
+    "/v1/forge/harvest/code",
+    { method: "POST", body: JSON.stringify(body) }
+  );
+
 export const forgeListUploads = () => call<UploadListResponse>("/v1/forge/uploads");
 
 export const forgeDeleteUpload = (filename: string) =>
