@@ -146,6 +146,28 @@ url = push_adapter_to_hub(
 )
 ```
 
+### Export adapter to GGUF (Sprint 03 / A1)
+
+For deployment via llama.cpp or Ollama, merge the adapter into its base
+model and export a quantized GGUF:
+
+```bash
+# One-time: vendor the llama.cpp toolchain (clones to ~/.local/llama.cpp)
+bash scripts/install_llamacpp.sh
+
+# Export
+python scripts/export_gguf.py \
+    --base-model Qwen/Qwen2.5-0.5B-Instruct \
+    --adapter outputs/ai_llm \
+    --output-dir outputs/ai_llm/artifacts \
+    --quant Q4_K_M
+```
+
+Produces `<adapter>-q4_k_m.gguf`, a `<adapter>-q4_k_m.metadata.json`
+sidecar (base id, adapter sha256, quant, file sha256, timestamp), and
+maintains a `latest.gguf` rollback pointer in the output directory.
+See `docs/SPRINTS.md` for sprint status.
+
 ---
 
 ## Evaluation pipeline

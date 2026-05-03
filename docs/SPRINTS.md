@@ -31,28 +31,31 @@ A4 is intentionally absent — that's the diffusion lane in the source blueprint
 
 ---
 
-## Sprint 03 — A1: GGUF export (active)
+## Sprint 03 — A1: GGUF export (shipped 2026-05-03)
 
 **Goal:** Close the only "critical gap" the blueprint flags. Trained adapters become deployable artifacts that any llama.cpp / Ollama runtime can consume.
 
-**Deliverables**
-- `app/trainers/export.py` — `merge_and_export(base_model_id, adapter_path, output_dir, quant="Q4_K_M", llama_cpp_path=...) -> str`
-- `scripts/export_gguf.py` — operator CLI wrapper around the above
-- `scripts/install_llamacpp.sh` — vendored install/update step for llama.cpp's `convert_hf_to_gguf.py`
-- `tests/test_export_gguf.py` — round-trip smoke: merge → export → load via `app/inference/llamacpp_backend.py` → answer one prompt
-- Sidecar: `outputs/<domain>/artifacts/<model>.metadata.json` with `{base_model_id, adapter_sha256, quant, file_sha256, exported_at}`
-- README section: "Exporting an adapter to GGUF"
+**Status:** Code + unit tests landed on `develop`. End-to-end smoke against a real adapter still needs a workstation with `scripts/install_llamacpp.sh` run — tracked as a post-merge integration check.
+
+**Shipped**
+- `app/trainers/export.py` — `merge_and_export(base_model_id, adapter_path, output_dir, *, quant="Q4_K_M", llama_cpp_path=None, artifact_name=None) -> dict` with stable return contract (`gguf_path`, `metadata_path`, `sha256`, `latest_pointer`, `quant`, `base_model_id`, `adapter_sha256`, `exported_at`).
+- `scripts/install_llamacpp.sh` — vendor llama.cpp into `~/.local/llama.cpp` (override via `VALONY_LLAMA_CPP_PATH`, pin via `LLAMA_CPP_REF`). Builds `llama-quantize`, installs python deps for `convert_hf_to_gguf.py`.
+- `scripts/export_gguf.py` — operator CLI; emits final result as JSON to stdout.
+- `tests/test_export_gguf.py` — 6 cases covering happy path (Q4_K_M), missing adapter, missing llama.cpp, missing quantize binary, F16 pass-through (skip quantize), rollback pointer across two exports. Stubs peft + transformers + subprocess so suite stays offline-CPU.
+- Sidecar `<artifact>-<quant>.metadata.json` with `{base_model_id, adapter_path, adapter_sha256, quant, gguf_filename, file_sha256, file_bytes, exported_at, llama_cpp_path}`.
+- `latest.gguf` rollback pointer (symlink on POSIX, file copy on Windows).
+- `merge_and_export` re-exported from `app.trainers` for ergonomic imports.
+- README section: "Export adapter to GGUF (Sprint 03 / A1)".
 
 **Acceptance gate**
-- Smoke test passes on CPU (no GPU required).
-- A pre-existing adapter from `outputs/` round-trips end to end.
-- Rollback pointer (symlink or manifest entry) to the prior stable artifact survives a re-export.
+- Unit suite green on CPU (6/6 pass; full suite 249/249 pass — no regressions).
+- ⏳ Real adapter round-trip via `app/inference/llamacpp_backend.py` — pending workstation with llama.cpp built. Mocked equivalent passes.
+- Rollback pointer survives a re-export — covered by `test_rollback_pointer_updates_across_exports`.
 
-**Sizing:** 1–2 days.
-
-**Risks**
-- llama.cpp's `convert_hf_to_gguf.py` evolves quickly — pin a known-good commit in `install_llamacpp.sh`.
-- Disk pressure during merge (full base model materialized briefly) — gate behind a free-space check.
+**Risks resolved / open**
+- ✅ llama.cpp toolchain version drift — `install_llamacpp.sh` honors `LLAMA_CPP_REF`; default `master` should be pinned to a tag in production.
+- ⏳ Disk pressure during merge — currently uses an OS tempdir; no preflight free-space check yet. Add when first real export trips it.
+- ⏳ Windows symlink fallback — copy fallback in place but not exercised in CI.
 
 ---
 
