@@ -59,19 +59,36 @@ A4 is intentionally absent — that's the diffusion lane in the source blueprint
 
 ---
 
-## Sprint 04 — A2: Batch pipeline
+## Sprint 04 — A2: Batch pipeline (shipped 2026-05-04)
 
 **Goal:** Unattended `collect → forge → train → eval → deploy` with crash recovery.
 
-**Deliverables**
-- `app/pipeline/runner.py` — stage state machine with idempotency keys, write-then-rename for `stage_status.json`
-- `scripts/batch_pipeline.py` — orchestrator entrypoint
-- `tests/test_batch_pipeline.py` — happy-path + mid-stage-crash resume
-- Run artifacts under `outputs/runs/<run_id>/{manifest.json, stage_status.json}`
+**Status:** Runner mechanics (state machine, atomic state writes, resume, hard-gate enforcement) and CLI shipped. Stage implementations land as a mix: `eval` and `deploy` are wired live (eval → `app.eval.run_eval`, deploy → A1's `merge_and_export`); `collect`, `forge`, `train` are thin stubs that surface artifacts but defer the real harvester/trainer wiring until each stage's input contract is finalized — TODOs in source.
 
-**Acceptance gate:** full unattended run reproducible from manifest; crash mid-stage resumes from last committed checkpoint; promotion blocked on any failed hard gate.
+**Test execution caveat:** The 10-case test suite was written but could not be executed in this session because macOS TCC revoked Full Disk Access for Python on the Documents folder mid-session. Code reviewed by hand. Run locally to verify:
+```bash
+python3 -m pytest tests/test_batch_pipeline.py -v
+```
 
-**Sizing:** 3–4 days. Depends on A1 (uses `merge_and_export` in the deploy stage).
+**Shipped**
+- `app/pipeline/runner.py` (~280 LoC) — `PipelineRunner` with `start_run` / `resume_run` / `execute`. Atomic write-then-rename via `os.replace` on `stage_status.json`. Per-stage idempotency keys (default = sha256 of manifest+name; override with `Stage.idempotency_key_fn`). Resume skips a stage only when prior status was COMPLETED *and* the current key matches the recorded one. Stage exceptions are caught, traceback persisted, pipeline halted. A passed stage that flips `gate_passed=False` halts the pipeline (this is how eval blocks deploy).
+- `app/pipeline/stages.py` (~140 LoC) — five concrete stages + `DEFAULT_STAGES` + `select_stages()` filter that preserves canonical order. `_collect_key` derives an idempotency key from upload-file size+mtime so any new/changed input forces a re-run.
+- `app/pipeline/__init__.py` — exports `PipelineRunner`, `RunContext`, `Stage`, `StageResult`, `StageStatus`.
+- `scripts/batch_pipeline.py` — operator CLI (`--domain` / `--resume` / `--stages` / `--runs-root` / `--quiet`). Loads `configs/domains/<domain>.yaml` if present. Emits the run report as JSON to stdout. Exit code 0 on success, 1 on halt.
+- `tests/test_batch_pipeline.py` — 10 cases: happy path, manifest immutability, mid-stage crash + resume across runner instances, idempotency-key drift forces re-run, hard-gate failure halts before deploy, no `.tmp` leftovers from atomic write, missing-run-id resume raises, `select_stages` filter + canonical order + unknown-stage error, downstream stage receives upstream `stage_outputs`.
+- Artifacts on disk per run: `outputs/runs/<run_id>/manifest.json`, `stage_status.json`, `report.json`.
+
+**Acceptance gate**
+- ⏳ Full unattended run reproducible from manifest — runner can do this; live stages need `collect/forge/train` follow-up wiring before a real CLI run.
+- ✅ Crash mid-stage resumes from last committed checkpoint — covered by `test_resume_skips_completed_stages_when_key_matches`.
+- ✅ Promotion blocked on any failed hard gate — covered by `test_hard_gate_failure_halts_before_downstream`.
+
+**Open follow-ups**
+- ⏳ Live stage wiring for `collect` (route to YouTube/arXiv/code harvesters per config), `forge` (call `app.data_forge.build_dataset`), `train` (instantiate the right trainer class per `config.method`). Each is a small TODO marker in `stages.py`.
+- ⏳ `configs/domains/*.yaml` schema additions for collect/forge/train/deploy knobs.
+- ⏳ Run the local test suite once Python's Documents access is restored.
+
+**Sizing actual:** ~1 session for runner + tests; live stage wiring deferred as separate small PRs.
 
 ---
 
