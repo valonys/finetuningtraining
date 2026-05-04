@@ -173,30 +173,38 @@ A4 is intentionally absent — that's the diffusion lane in the source blueprint
 
 ## Sprint 07 — Frontend production + App Runner serving
 
-**Goal:** Make the frontend deployable and stand up the cheap MVP demo lane on AWS. Promotes the previously "opportunistic" App Runner sprint to a real slot now that S06 makes the build green and the API safe to expose.
+**Goal:** Make the frontend deployable and stand up the MVP demo lane on AWS App Runner. Promotes the previously "opportunistic" App Runner sprint to a real slot now that S06 makes the build green and the API safe to expose.
 
-**Budget target:** $0–$5/mo (App Runner Auto Pause idle ≈ $3.30/mo provisioned-memory-only; active vCPU billed per request).
+**App Runner deprecation note (2026-05-04):** AWS closed App Runner to *new customers* effective 2026-04-30. **This account already has App Runner services running and is grandfathered**, so we can keep deploying to it. Decision made with full awareness of the deprecation: user explicitly chose to reuse existing well-understood App Runner over (a) Fly.io (rejected — second cloud to manage) and (b) ECS Express Mode (deferred — fixed-cost ALB baseline risks blowing the $5/mo cap; revisit only when scale justifies the haywire). When App Runner reaches end-of-life or scale demands more, the natural exit is ECS Express, not Fly.io.
+
+**Budget target:** $0–$5/mo (App Runner Auto Pause idle ≈ $3.30/mo provisioned-memory-only; active vCPU billed per request). Hard ceiling — see memory `serving_cost_constraints.md`.
 
 **Deliverables — frontend serving model**
 - **Decision** (record in PR): FastAPI `StaticFiles` mount at `/` with SPA fallback (`/{full_path:path}` → `index.html`) **vs** S3 + CloudFront for the SPA + API on a separate origin.
   - Default lean: **separate origins** (S3/CloudFront for SPA, App Runner for API). Cheaper, scales independently, lets the static side stay free-tier; App Runner stays single-purpose.
   - StaticFiles mount path is the fallback if you'd rather have one container handle both (simpler ops, slightly more compute per request).
 - Implement chosen path. If separate origins: keep the existing Vite build, add an `npm run build && aws s3 sync dist/ s3://...` script. If StaticFiles: mount in `app/main.py` with the SPA fallback route.
-- **Dockerfile harden:** the current image copies `frontend/dist` but uvicorn doesn't serve it (assessment item 3). Either drop the copy (separate-origins path) or wire the StaticFiles mount.
+- **Dockerfile harden:** the current image copies `frontend/dist` but uvicorn doesn't serve it (S06 audit item 3). Either drop the copy (separate-origins path) or wire the StaticFiles mount.
 
 **Deliverables — App Runner**
 - `apprunner.yaml` at repo root — `runtime: python311`, build command, start command (`uvicorn app.main:app --host 0.0.0.0 --port 8000`), 0.25 vCPU / 0.5 GB, Auto Pause on.
 - Slimmed CPU-only Docker target (`Dockerfile.apprunner` or a new stage on the existing Dockerfile) — drop `torch`/`unsloth`/`vllm` extras, keep only what's needed for `VALONY_INFERENCE_BACKEND=ollama`.
+- Reuse the existing grandfathered App Runner service rather than creating a new one (new-customer creation is closed).
 - IaC bits: `infra/apprunner-service.tf` or a one-shot bootstrap script (decide based on user pref).
 
 **Hard constraints**
 - App Runner has no GPU and no room for an in-process model. Generation MUST proxy to Ollama Cloud / OpenRouter / HF Inference. Never load a HF/vLLM model in this image.
-- `VALONY_CORS_ORIGINS` (from S06) must include the SPA origin (CloudFront or App Runner static path).
+- `VALONY_CORS_ORIGINS` (from S06) must include the SPA origin (CloudFront URL or App Runner static path).
+- Cost cap is hard, not aspirational. First week of real demo traffic must be checked against actual billing — if creeping above $5/mo, throttle traffic or shrink the instance before considering scope changes.
 
 **Acceptance gate**
 - ✅ `frontend/dist` served correctly in production (whichever serving model is chosen) — manual smoke + a CI check that fetches `/` from a built container.
 - ✅ End-to-end `curl https://<apprunner>/healthz` and SPA loads in a browser.
 - ✅ Monthly bill under $5 for a week of pitch-deck-volume traffic.
+
+**Exit ramp (when triggered, not in S07 scope)**
+- App Runner end-of-life announcement OR sustained traffic that warrants scaling beyond Auto Pause → migrate to **Amazon ECS Express Mode** (AWS-blessed successor; ALB baseline acceptable when traffic justifies it).
+- Fly.io is *not* on the exit ramp — user has explicitly ruled out spinning up a second cloud.
 
 **Sizing:** 1 sprint. Frontend serving model decision is the only non-mechanical step.
 
