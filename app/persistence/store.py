@@ -44,27 +44,39 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────
 # Protocols — what every backend must implement
 # ──────────────────────────────────────────────────────────────
+# Every method takes ``tenant_id`` as a required positional arg
+# (A6b). There is intentionally no escape hatch — tenant isolation
+# is enforced at the storage boundary, not by handler discipline.
+# Cross-tenant admin views (when needed for ops dashboards) get
+# explicit ``list_all_admin``-style methods that scream "you bypassed
+# tenant" at the call site. Today: not needed.
+
+
 class JobStore(Protocol):
-    def create(self, job_id: str, payload: dict[str, Any]) -> None: ...
-    def get(self, job_id: str) -> dict[str, Any] | None: ...
-    def list(self, *, status: str | None = None) -> list[dict[str, Any]]: ...
-    def update_fields(self, job_id: str, **fields: Any) -> dict[str, Any] | None: ...
-    def delete(self, job_id: str) -> bool: ...
+    def create(self, job_id: str, tenant_id: str, payload: dict[str, Any]) -> None: ...
+    def get(self, job_id: str, tenant_id: str) -> dict[str, Any] | None: ...
+    def list(self, tenant_id: str, *, status: str | None = None) -> list[dict[str, Any]]: ...
+    def update_fields(self, job_id: str, tenant_id: str, **fields: Any) -> dict[str, Any] | None: ...
+    def delete(self, job_id: str, tenant_id: str) -> bool: ...
 
 
 class RunStore(Protocol):
-    def upsert_run(self, run_id: str, payload: dict[str, Any]) -> None: ...
-    def get_run(self, run_id: str) -> dict[str, Any] | None: ...
-    def list_runs(self, *, domain: str | None = None) -> list[dict[str, Any]]: ...
+    def upsert_run(self, run_id: str, tenant_id: str, payload: dict[str, Any]) -> None: ...
+    def get_run(self, run_id: str, tenant_id: str) -> dict[str, Any] | None: ...
+    def list_runs(self, tenant_id: str, *, domain: str | None = None) -> list[dict[str, Any]]: ...
 
 
 # ──────────────────────────────────────────────────────────────
 # SQLite implementation — used for both JobStore and RunStore
 # ──────────────────────────────────────────────────────────────
-_SCHEMA = [
+# Tables FIRST, then migrations bring legacy tables forward, THEN
+# indexes — the indexes reference tenant_id which a pre-A6b table
+# doesn't have until the migration runs.
+_TABLES = [
     """
     CREATE TABLE IF NOT EXISTS jobs (
         job_id     TEXT PRIMARY KEY,
+        tenant_id  TEXT NOT NULL DEFAULT 'public',
         status     TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -74,17 +86,33 @@ _SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS runs (
         run_id     TEXT PRIMARY KEY,
+        tenant_id  TEXT NOT NULL DEFAULT 'public',
         domain     TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         payload    TEXT NOT NULL
     )
     """,
-    "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)",
-    "CREATE INDEX IF NOT EXISTS idx_jobs_updated ON jobs(updated_at)",
-    "CREATE INDEX IF NOT EXISTS idx_runs_domain ON runs(domain)",
-    "CREATE INDEX IF NOT EXISTS idx_runs_updated ON runs(updated_at)",
 ]
+
+_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_jobs_tenant_status ON jobs(tenant_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_tenant_updated ON jobs(tenant_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_runs_tenant_domain ON runs(tenant_id, domain)",
+    "CREATE INDEX IF NOT EXISTS idx_runs_tenant_updated ON runs(tenant_id, updated_at)",
+]
+
+
+# Additive migrations — SQLite has no ALTER TABLE ... ADD COLUMN
+# IF NOT EXISTS until very recent versions, so we introspect first.
+def _migrate_add_tenant_column(conn, table: str) -> None:
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if "tenant_id" not in cols:
+        # Existing pre-A6b rows get the synthetic 'public' tenant so
+        # auth-disabled workflows keep accessing them.
+        conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'public'"
+        )
 
 
 class SQLiteStore:
@@ -113,7 +141,17 @@ class SQLiteStore:
 
     def _init_schema(self) -> None:
         with self._lock:
-            for stmt in _SCHEMA:
+            # 1. Create-if-missing tables (no-op when they already exist)
+            for stmt in _TABLES:
+                self._conn.execute(stmt)
+            # 2. Bring pre-A6b tables forward by adding the tenant_id
+            #    column. Safe to re-run; the function is a no-op on
+            #    tables that already have the column.
+            _migrate_add_tenant_column(self._conn, "jobs")
+            _migrate_add_tenant_column(self._conn, "runs")
+            # 3. Indexes last — they reference tenant_id which the
+            #    migration above just guaranteed exists.
+            for stmt in _INDEXES:
                 self._conn.execute(stmt)
 
     @staticmethod
@@ -122,97 +160,123 @@ class SQLiteStore:
         # order deterministically by ``updated_at`` in list queries.
         return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
-    # ── JobStore ──────────────────────────────────────────────
-    def create(self, job_id: str, payload: dict[str, Any]) -> None:
+    # ── JobStore (tenant-scoped) ──────────────────────────────
+    def create(self, job_id: str, tenant_id: str, payload: dict[str, Any]) -> None:
         ts = self._now()
         status = str(payload.get("status", "queued"))
+        # Stamp tenant into payload so on read we return it without
+        # an extra column projection.
+        payload = {**payload, "tenant_id": tenant_id}
         with self._lock:
             self._conn.execute(
-                "INSERT INTO jobs (job_id, status, created_at, updated_at, payload) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (job_id, status, ts, ts, json.dumps(payload, default=str)),
+                "INSERT INTO jobs (job_id, tenant_id, status, created_at, updated_at, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (job_id, tenant_id, status, ts, ts, json.dumps(payload, default=str)),
             )
 
-    def get(self, job_id: str) -> dict[str, Any] | None:
+    def get(self, job_id: str, tenant_id: str) -> dict[str, Any] | None:
+        """Return the job iff it belongs to ``tenant_id``. Cross-tenant
+        access returns None — no information leak about whether the
+        id exists in some other tenant."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT payload FROM jobs WHERE job_id = ?", (job_id,)
+                "SELECT payload FROM jobs WHERE job_id = ? AND tenant_id = ?",
+                (job_id, tenant_id),
             ).fetchone()
         return json.loads(row["payload"]) if row else None
 
-    def list(self, *, status: str | None = None) -> list[dict[str, Any]]:
+    def list(self, tenant_id: str, *, status: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
             if status is None:
                 rows = self._conn.execute(
-                    "SELECT payload FROM jobs ORDER BY updated_at DESC"
+                    "SELECT payload FROM jobs WHERE tenant_id = ? "
+                    "ORDER BY updated_at DESC",
+                    (tenant_id,),
                 ).fetchall()
             else:
                 rows = self._conn.execute(
-                    "SELECT payload FROM jobs WHERE status = ? ORDER BY updated_at DESC",
-                    (status,),
+                    "SELECT payload FROM jobs WHERE tenant_id = ? AND status = ? "
+                    "ORDER BY updated_at DESC",
+                    (tenant_id, status),
                 ).fetchall()
         return [json.loads(r["payload"]) for r in rows]
 
     def update_fields(
-        self, job_id: str, **fields: Any
+        self, job_id: str, tenant_id: str, **fields: Any
     ) -> dict[str, Any] | None:
-        """Patch one or more fields on a stored job. Returns the new
-        full payload, or None if the job_id is unknown. Read-modify-write
-        happens under the lock so concurrent updates don't lose data."""
+        """Patch fields on a job iff it belongs to ``tenant_id``.
+        Returns None on unknown id OR cross-tenant id."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT payload FROM jobs WHERE job_id = ?", (job_id,)
+                "SELECT payload FROM jobs WHERE job_id = ? AND tenant_id = ?",
+                (job_id, tenant_id),
             ).fetchone()
             if row is None:
                 return None
             payload = json.loads(row["payload"])
             payload.update(fields)
+            payload["tenant_id"] = tenant_id     # keep mirror consistent
             ts = self._now()
             new_status = str(payload.get("status", "queued"))
             self._conn.execute(
                 "UPDATE jobs SET status = ?, updated_at = ?, payload = ? "
-                "WHERE job_id = ?",
-                (new_status, ts, json.dumps(payload, default=str), job_id),
+                "WHERE job_id = ? AND tenant_id = ?",
+                (new_status, ts, json.dumps(payload, default=str), job_id, tenant_id),
             )
             return payload
 
-    def delete(self, job_id: str) -> bool:
+    def delete(self, job_id: str, tenant_id: str) -> bool:
         with self._lock:
-            cur = self._conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+            cur = self._conn.execute(
+                "DELETE FROM jobs WHERE job_id = ? AND tenant_id = ?",
+                (job_id, tenant_id),
+            )
             return cur.rowcount > 0
 
-    # ── RunStore ──────────────────────────────────────────────
-    def upsert_run(self, run_id: str, payload: dict[str, Any]) -> None:
+    # ── RunStore (tenant-scoped) ──────────────────────────────
+    def upsert_run(self, run_id: str, tenant_id: str, payload: dict[str, Any]) -> None:
         ts = self._now()
         domain = str(payload.get("domain", ""))
+        payload = {**payload, "tenant_id": tenant_id}
         with self._lock:
+            # ON CONFLICT: a different tenant trying to upsert the same
+            # run_id would silently overwrite. We reject by gating the
+            # update on the tenant matching — different-tenant upserts
+            # become no-ops at the storage level.
             self._conn.execute(
-                "INSERT INTO runs (run_id, domain, created_at, updated_at, payload) "
-                "VALUES (?, ?, ?, ?, ?) "
+                "INSERT INTO runs (run_id, tenant_id, domain, created_at, updated_at, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(run_id) DO UPDATE SET "
                 "  domain     = excluded.domain, "
                 "  updated_at = excluded.updated_at, "
-                "  payload    = excluded.payload",
-                (run_id, domain, ts, ts, json.dumps(payload, default=str)),
+                "  payload    = excluded.payload "
+                "WHERE runs.tenant_id = excluded.tenant_id",
+                (run_id, tenant_id, domain, ts, ts, json.dumps(payload, default=str)),
             )
 
-    def get_run(self, run_id: str) -> dict[str, Any] | None:
+    def get_run(self, run_id: str, tenant_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT payload FROM runs WHERE run_id = ?", (run_id,)
+                "SELECT payload FROM runs WHERE run_id = ? AND tenant_id = ?",
+                (run_id, tenant_id),
             ).fetchone()
         return json.loads(row["payload"]) if row else None
 
-    def list_runs(self, *, domain: str | None = None) -> list[dict[str, Any]]:
+    def list_runs(
+        self, tenant_id: str, *, domain: str | None = None
+    ) -> list[dict[str, Any]]:
         with self._lock:
             if domain is None:
                 rows = self._conn.execute(
-                    "SELECT payload FROM runs ORDER BY updated_at DESC"
+                    "SELECT payload FROM runs WHERE tenant_id = ? "
+                    "ORDER BY updated_at DESC",
+                    (tenant_id,),
                 ).fetchall()
             else:
                 rows = self._conn.execute(
-                    "SELECT payload FROM runs WHERE domain = ? ORDER BY updated_at DESC",
-                    (domain,),
+                    "SELECT payload FROM runs WHERE tenant_id = ? AND domain = ? "
+                    "ORDER BY updated_at DESC",
+                    (tenant_id, domain),
                 ).fetchall()
         return [json.loads(r["payload"]) for r in rows]
 

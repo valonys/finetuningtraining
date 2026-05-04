@@ -43,7 +43,7 @@ from typing import Any, Dict, List
 
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -81,6 +81,14 @@ from app.models import (
     ForgeIngestRequest,
     HealthResponse,
     JobStatus,
+    MultimodalIndexRequest,
+    MultimodalIndexResponse,
+    MultimodalRAGRequest,
+    MultimodalRAGResponse,
+    MultimodalSearchRequest,
+    MultimodalSearchResponse,
+    MultimodalSearchResult,
+    MultimodalStatsResponse,
     RegistryPromoteRequest,
     RegistryRollbackRequest,
     TrainingJobRequest,
@@ -105,7 +113,19 @@ from app.registry import (
     UnknownVersion,
     default_registry,
 )
+from app.audit import AuditAction, default_logger
 from app.auth import auth_middleware, is_auth_required
+from app.auth.middleware import get_claims
+from app.multimodal import (
+    ContextBuilder,
+    Modality,
+    MultimodalPipeline,
+    PipelineConfig,
+    RAGEngine,
+    SQLiteVectorStore,
+)
+from app.multimodal.processors import records_from_data_forge
+from app.multimodal.providers import resolve_embedder
 from app.persistence import default_store
 from app.security import (
     PathValidationError,
@@ -133,34 +153,47 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger(__name__)
 
 # A5: jobs persist to SQLite via the default store so they survive a
-# uvicorn restart. The dict-based job_registry was removed; everything
-# routes through ``_jobs`` (instantiated lazily so tests can override
-# VALONY_PERSISTENCE_PATH before first access).
+# uvicorn restart.
+# A6b: every store method takes tenant_id; helpers thread it through
+# so handlers don't have to remember to scope each call. JobStatus
+# strips/adds the tenant_id on the way out/in since the model itself
+# isn't (yet) tenant-aware — easier than a Pydantic schema migration.
 def _jobs():
     return default_store()
 
 
 def _job_to_status(payload: dict[str, Any]) -> JobStatus:
-    """Hydrate a stored payload back into a JobStatus model."""
+    """Hydrate a stored payload back into a JobStatus model.
+    Drops the tenant_id key since JobStatus doesn't define it."""
+    if "tenant_id" in payload:
+        payload = {k: v for k, v in payload.items() if k != "tenant_id"}
     return JobStatus.model_validate(payload)
 
 
-def _store_job(job: JobStatus) -> None:
-    _jobs().create(job.job_id, job.model_dump(mode="json"))
+def _store_job(job: JobStatus, tenant_id: str = "public") -> None:
+    _jobs().create(job.job_id, tenant_id, job.model_dump(mode="json"))
 
 
-def _update_job(job_id: str, **fields: Any) -> JobStatus | None:
-    payload = _jobs().update_fields(job_id, **fields)
+def _update_job(job_id: str, tenant_id: str = "public", **fields: Any) -> JobStatus | None:
+    payload = _jobs().update_fields(job_id, tenant_id, **fields)
     return _job_to_status(payload) if payload else None
 
 
-def _get_job(job_id: str) -> JobStatus | None:
-    payload = _jobs().get(job_id)
+def _get_job(job_id: str, tenant_id: str = "public") -> JobStatus | None:
+    payload = _jobs().get(job_id, tenant_id)
     return _job_to_status(payload) if payload else None
 
 
-def _list_jobs() -> List[JobStatus]:
-    return [_job_to_status(p) for p in _jobs().list()]
+def _list_jobs(tenant_id: str = "public") -> List[JobStatus]:
+    return [_job_to_status(p) for p in _jobs().list(tenant_id)]
+
+
+def _tenant_of(request) -> str:
+    """Extract tenant_id from the request's auth claims. Middleware
+    guarantees claims are always set; falls back to 'public' for any
+    handler somehow reached without it (defensive)."""
+    claims = getattr(request.state, "claims", None)
+    return claims.tenant_id if claims is not None else "public"
 
 DEFAULT_BASE_MODEL = os.environ.get("VALONY_BASE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 # Opt-in override — set VALONY_INFERENCE_BACKEND=ollama to route generation
@@ -260,6 +293,91 @@ def _validated_paths(paths: list[str]) -> list[str]:
         except PathValidationError as exc:
             raise HTTPException(422, f"path rejected: {exc}")
     return out
+
+
+_MM_STORE: SQLiteVectorStore | None = None
+
+
+def _multimodal_store() -> SQLiteVectorStore:
+    global _MM_STORE
+    if _MM_STORE is None:
+        db_path = os.environ.get("VALONY_MM_INDEX_DB", "outputs/.multimodal/index.db")
+        _MM_STORE = SQLiteVectorStore(db_path)
+    return _MM_STORE
+
+
+def _tenant_from_request(request: Request, override: str | None = None) -> str:
+    if override:
+        return override
+    return get_claims(request).tenant_id
+
+
+def _modality(value: str | None) -> Modality | None:
+    return Modality(value) if value else None
+
+
+def _multimodal_pipeline(
+    *,
+    tenant_id: str,
+    collection: str,
+    chunk_target_chars: int = 1200,
+    chunk_overlap_chars: int = 160,
+    embedding_dim: int = 384,
+    embed_provider: str = "hash",
+) -> MultimodalPipeline:
+    config = PipelineConfig(
+        tenant_id=tenant_id,
+        collection=collection,
+        chunk_target_chars=chunk_target_chars,
+        chunk_overlap_chars=chunk_overlap_chars,
+        embedding_dim=embedding_dim,
+    )
+    embedder = resolve_embedder(embed_provider, dim=embedding_dim)
+    return MultimodalPipeline(
+        config=config,
+        embedder=embedder,
+        vector_store=_multimodal_store(),
+    )
+
+
+def _mm_result(result) -> MultimodalSearchResult:
+    chunk = result.chunk
+    src = chunk.source
+    return MultimodalSearchResult(
+        chunk_id=chunk.chunk_id,
+        record_id=chunk.record_id,
+        text=chunk.text,
+        score=result.score,
+        source_type=src.source_type.value,
+        source_uri=src.source_uri,
+        title=src.title,
+        start_time_s=src.start_time_s,
+        end_time_s=src.end_time_s,
+        page=src.page,
+        metadata=chunk.metadata,
+    )
+
+
+def _audit(
+    request: Request,
+    *,
+    action: AuditAction,
+    target_id: str | None = None,
+    success: bool = True,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    try:
+        claims = get_claims(request)
+        default_logger().log(
+            tenant_id=claims.tenant_id,
+            user_id=claims.user_id,
+            action=action,
+            target_id=target_id,
+            success=success,
+            metadata=metadata or {},
+        )
+    except Exception as exc:
+        logger.warning(f"audit logging failed for {action}: {exc}")
 
 
 # ──────────────────────────────────────────────────────────────
