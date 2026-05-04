@@ -4,6 +4,7 @@ from .dpo_trainer import AgnosticDPOTrainer
 from .orpo_trainer import AgnosticORPOTrainer
 from .kto_trainer import AgnosticKTOTrainer
 from .grpo_trainer import AgnosticGRPOTrainer
+from .export import merge_and_export
 
 __all__ = [
     "AgnosticSFTTrainer",
@@ -11,4 +12,5 @@ __all__ = [
     "AgnosticORPOTrainer",
     "AgnosticKTOTrainer",
     "AgnosticGRPOTrainer",
+    "merge_and_export",
 ]

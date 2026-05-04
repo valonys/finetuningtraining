@@ -78,6 +78,8 @@ from app.models import (
     ForgeIngestRequest,
     HealthResponse,
     JobStatus,
+    RegistryPromoteRequest,
+    RegistryRollbackRequest,
     TrainingJobRequest,
     UploadListResponse,
     UploadResponse,
@@ -90,6 +92,20 @@ from app.models import (
     ArxivHarvestedPaperInfo,
     CodeHarvestRequest,
     CodeHarvestResponse,
+)
+from app.registry import (
+    InvalidTransition,
+    ModelRegistry,
+    ModelStatus,
+    ModelVersion,
+    RollbackResult,
+    UnknownVersion,
+    default_registry,
+)
+from app.security import (
+    PathValidationError,
+    resolve_cors_origins,
+    validated_path,
 )
 from app.uploads import (
     UploadError,
@@ -171,12 +187,32 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS allowlist resolved from VALONY_CORS_ORIGINS (comma-separated).
+# Default keeps dev origins (Vite at :5173) so local dev works untouched;
+# production deploys MUST set the env var explicitly. Wildcard is gone
+# as of S06 — exposing this API to "*" was an obvious foot-gun once
+# auth lands in A6.
+_cors_origins = resolve_cors_origins()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+logger.info(f"CORS allowlist: {_cors_origins}")
+
+
+def _validated_paths(paths: list[str]) -> list[str]:
+    """S06 chokepoint for endpoints that take user-supplied paths.
+    Re-raises as 422 so the client gets a clear actionable error."""
+    out: list[str] = []
+    for raw in paths:
+        try:
+            out.append(str(validated_path(raw)))
+        except PathValidationError as exc:
+            raise HTTPException(422, f"path rejected: {exc}")
+    return out
 
 
 # ──────────────────────────────────────────────────────────────
@@ -507,15 +543,25 @@ async def forge_harvest_code(req: CodeHarvestRequest):
     from app.harvesters.code import CodeHarvester
 
     try:
+        safe_path = str(validated_path(req.path, must_exist=True))
+        safe_output_dir = (
+            str(validated_path(req.output_dir)) if req.output_dir else None
+        )
+    except PathValidationError as exc:
+        raise HTTPException(422, f"path rejected: {exc}")
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+
+    try:
         harvester = CodeHarvester()
         report = await asyncio.to_thread(
             harvester.harvest_directory,
-            req.path,
+            safe_path,
             strategy=req.strategy,
             source_label=req.source_label,
             min_lines=req.min_lines,
             max_lines=req.max_lines,
-            output_dir=req.output_dir,
+            output_dir=safe_output_dir,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -538,9 +584,10 @@ async def forge_harvest_code(req: CodeHarvestRequest):
 # ──────────────────────────────────────────────────────────────
 @app.post("/v1/forge/ingest")
 async def forge_ingest(req: ForgeIngestRequest):
+    safe_paths = _validated_paths(req.paths)
     forge = DataForge(ocr_engine=req.ocr_engine)
     try:
-        records = forge.ingest(req.paths)
+        records = forge.ingest(safe_paths)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {
@@ -560,9 +607,10 @@ async def forge_ingest(req: ForgeIngestRequest):
 
 @app.post("/v1/forge/build_dataset", response_model=ForgeBuildResponse)
 async def forge_build(req: ForgeBuildRequest):
+    safe_paths = _validated_paths(req.paths)
     forge = DataForge()
     try:
-        records = forge.ingest(req.paths)
+        records = forge.ingest(safe_paths)
         # Normalise "auto" sentinel to None so the DatasetBuilder
         # auto-resolves the template from the base model id.
         template_override = (
@@ -723,6 +771,80 @@ async def get_job(job_id: str):
 @app.get("/v1/jobs", response_model=List[JobStatus])
 async def list_jobs():
     return list(job_registry.values())
+
+
+# ──────────────────────────────────────────────────────────────
+# Model registry (A3) — promote / rollback control
+# ──────────────────────────────────────────────────────────────
+def _registry() -> ModelRegistry:
+    """Indirection so tests can monkeypatch the registry root."""
+    return default_registry()
+
+
+def _coerce_status(value: str) -> ModelStatus:
+    try:
+        return ModelStatus(value)
+    except ValueError:
+        raise HTTPException(
+            422,
+            f"invalid status '{value}': expected one of "
+            f"{[s.value for s in ModelStatus]}",
+        )
+
+
+@app.get("/v1/registry", response_model=List[ModelVersion])
+async def list_registry(
+    domain: str | None = None,
+    status: str | None = None,
+):
+    """List registered model versions, newest first. Optional filters
+    by ``domain`` and ``status``."""
+    status_enum = _coerce_status(status) if status is not None else None
+    return _registry().list(domain=domain, status=status_enum)
+
+
+@app.get("/v1/registry/{model_version}", response_model=ModelVersion)
+async def get_registry_version(model_version: str):
+    try:
+        return _registry().get(model_version)
+    except UnknownVersion:
+        raise HTTPException(404, f"unknown model_version: {model_version}")
+
+
+@app.post("/v1/registry/promote", response_model=ModelVersion)
+async def promote_model(req: RegistryPromoteRequest):
+    """Move a model version to a new status. Promoting to PRODUCTION
+    auto-rolls-back any existing production for the same domain."""
+    target = _coerce_status(req.to_status)
+    try:
+        return _registry().promote(
+            req.model_version,
+            to_status=target,
+            actor=req.actor,
+            reason=req.reason,
+        )
+    except UnknownVersion:
+        raise HTTPException(404, f"unknown model_version: {req.model_version}")
+    except InvalidTransition as exc:
+        raise HTTPException(409, str(exc))
+
+
+@app.post("/v1/registry/rollback", response_model=RollbackResult)
+async def rollback_model(req: RegistryRollbackRequest):
+    """Demote the current production for ``domain`` to ROLLED_BACK and
+    promote a replacement (explicit ``target_version`` or auto-picked
+    most recent STAGING / ROLLED_BACK version)."""
+    try:
+        return _registry().rollback(
+            domain=req.domain,
+            target_version=req.target_version,
+            actor=req.actor,
+            reason=req.reason,
+        )
+    except UnknownVersion as exc:
+        raise HTTPException(404, f"unknown model_version: {exc.args[0]}")
+    except InvalidTransition as exc:
+        raise HTTPException(409, str(exc))
 
 
 # ──────────────────────────────────────────────────────────────
