@@ -262,17 +262,47 @@ A4 is intentionally absent — that's the diffusion lane in the source blueprint
 
 ---
 
-## Sprint 09 — A6a: JWT auth + tenant context
+## Sprint 09 — A6a: JWT auth + tenant context (shipped 2026-05-04)
 
-**Deliverables**
-- `app/auth/jwt.py` — token validation, claims extraction
-- `app/auth/middleware.py` — FastAPI middleware that attaches `tenant_id` to request state
-- `tests/test_auth_jwt.py`
-- All existing endpoints accept (and require, except `/healthz`) a valid token. Includes the new registry endpoints from A3 (`/v1/registry/promote`, `/v1/registry/rollback`) and S08's cost/SLO surfaces.
+**Goal:** Enforce JWT-based auth across the API surface and surface a typed tenant identifier for every authenticated request.
 
-**Acceptance gate:** every protected endpoint rejects missing/invalid tokens; tenant id is available to handlers.
+**Status:** Shipped. 39 new unit tests green; full suite 379/379, no regressions. FastAPI loads cleanly with auth middleware registered; dev mode logs a clear "auth DISABLED" banner.
 
-**Sizing:** 3 days.
+**Design choice — middleware vs per-route Depends:** chose ASGI middleware so applying auth uniformly across the existing 30+ endpoints didn't require touching every signature. Endpoints just read ``request.state.claims`` when they need to scope something. Cannot be forgotten when adding a new route.
+
+**Activation gate:** ``VALONY_AUTH_REQUIRED=1`` (also accepts ``true``/``yes``/``on``) flips strict mode. Default off keeps dev unchanged. The deploy guide instructs ops to set the env var alongside ``VALONY_JWT_SECRET`` (HS256) or ``VALONY_JWT_PUBLIC_KEY`` (RS256).
+
+**Shipped — auth module**
+- `app/auth/jwt.py` — `JWTConfig` dataclass (algorithm/secret/public_key/issuer/audience/leeway + per-claim name overrides), `TokenClaims` (typed first-class `tenant_id` / `user_id` / `roles` plus raw payload), `decode_token()` validator, `resolve_jwt_config()` env reader, `public_claims()` synthetic for dev mode. Errors hierarchy: `AuthError` → `MissingToken` / `InvalidToken` / `ExpiredToken`. HS256 + RS256 both supported. `exp` is required by default — tokens-without-exp rejected as a security policy. PyJWT imported lazily so the module is importable without the dep (clear error at decode time).
+- `app/auth/middleware.py` — `auth_middleware` (ASGI), `is_auth_required` env resolver, `get_claims(request)` typed accessor. Public-path allowlist: `/healthz`, `/openapi.json`, `/docs`, `/docs/oauth2-redirect`, `/redoc`. Bearer scheme strictly enforced (case-insensitive). 401 responses include a `WWW-Authenticate: Bearer realm="valonylabs"` header and a structured `{detail, code}` body where `code` is one of `missing_token` / `token_expired` / `invalid_token` / `auth_error` for client diagnostics.
+- `app/auth/__init__.py` — public re-exports.
+
+**Shipped — main.py wiring**
+- `app/main.py` — registers the middleware via `app.middleware("http")(auth_middleware)`. Boot logs whichever mode is active. Endpoints unchanged (no per-route signature changes); they can read `request.state.claims.tenant_id` going forward.
+
+**Shipped — deps**
+- `pyproject.toml` core deps: `pyjwt>=2.8`.
+- `requirements-cpu.txt`: `pyjwt>=2.8`.
+- `requirements-test.txt`: `pyjwt>=2.8` (test minting via `pyjwt.encode`).
+
+**Shipped — tests (39 cases in `tests/test_auth_jwt.py`)**
+- `decode_token` (16): HS256 happy path, expired (raises ExpiredToken), bad signature (raises InvalidToken), missing tenant claim, missing exp claim, custom tenant/user/roles claim names, roles-as-string normalization, roles-missing → empty list, issuer accept/reject, audience reject, unsupported algorithm, HS256-without-secret, RS256-without-public-key, empty token, leeway tolerates small skew.
+- `resolve_jwt_config` (2): defaults when env unset; full env mapping incl. RS256 + custom claim names.
+- `is_auth_required` (11): default off; truthy values (`1`/`true`/`TRUE`/`yes`/`on`) enable; falsy (`0`/`false`/`no`/`off`/empty) disable.
+- `public_claims` (1): synthetic shape stable.
+- `auth_middleware` (9): `/healthz` always public even in strict mode; dev mode attaches `public` tenant; strict mode rejects missing token / wrong scheme / invalid signature / expired token; strict mode accepts a valid token and surfaces the tenant; POST endpoints enforce auth same as GETs.
+
+**Acceptance gate**
+- ✅ Every protected endpoint rejects missing/invalid tokens — `test_middleware_strict_mode_rejects_*` (5 cases).
+- ✅ Tenant id is available to handlers — `test_middleware_strict_mode_accepts_valid_token` reads `request.state.claims.tenant_id` and returns it.
+- ✅ `/healthz` and OpenAPI surfaces stay public — `test_middleware_health_always_public`.
+
+**Open follow-ups**
+- ⏳ **Per-tenant scoping of existing handlers**: A6a establishes the auth boundary; actually using `claims.tenant_id` to filter `/v1/jobs`, `/v1/registry`, `/v1/forge/uploads`, etc., is A6b's job. Today every authenticated request still sees the global view.
+- ⏳ **JWKS endpoint fetching for RS256**: today `VALONY_JWT_PUBLIC_KEY` is a static PEM. For Auth0/Cognito/Okta integration we'll want a JWKS-URL fetcher with caching. Small follow-up when an external IdP lands.
+- ⏳ **Role-based authorization helpers**: claims expose `roles` but no `require_role("admin")` decorator yet. Add when the first endpoint needs role-gating (e.g. `POST /v1/registry/promote` for production releases).
+
+**Sizing actual:** ~1 session for module + middleware + main.py wiring + tests + dep updates.
 
 ---
 

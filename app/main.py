@@ -105,6 +105,7 @@ from app.registry import (
     UnknownVersion,
     default_registry,
 )
+from app.auth import auth_middleware, is_auth_required
 from app.persistence import default_store
 from app.security import (
     PathValidationError,
@@ -233,6 +234,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 logger.info(f"CORS allowlist: {_cors_origins}")
+
+# A6a: JWT auth middleware. Disabled by default (dev mode) — set
+# VALONY_AUTH_REQUIRED=1 in production along with VALONY_JWT_SECRET
+# (HS256) or VALONY_JWT_PUBLIC_KEY (RS256). When disabled, every
+# request gets a synthetic ``public`` tenant attached so downstream
+# code can rely on request.state.claims being set unconditionally.
+app.middleware("http")(auth_middleware)
+if is_auth_required():
+    logger.info("🔒 JWT auth ENABLED (VALONY_AUTH_REQUIRED=1)")
+else:
+    logger.info(
+        "🔓 JWT auth DISABLED — all requests route as tenant 'public'. "
+        "Set VALONY_AUTH_REQUIRED=1 in production."
+    )
 
 
 def _validated_paths(paths: list[str]) -> list[str]:
