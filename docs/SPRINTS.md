@@ -1,6 +1,6 @@
 # ValonyLabs Studio — Sprint Plan
 
-**Last updated:** 2026-05-03
+**Last updated:** 2026-05-04
 **Lane:** A (production autoregressive). Diffusion / dLLM lane out of scope.
 **Strategy spec:** `docs/BLUEPRINT_ADOPTION_GUIDE.md` on `origin/main` at commit `fb75bc1` (PR #13). Not merged into `develop` by design — this file is the local execution surface, the remote doc is the strategy reference.
 **Execution backlog:** `docs/BLUEPRINT_EXECUTION_BACKLOG.md` on the same remote commit.
@@ -8,16 +8,23 @@
 ## Sequence
 
 ```
-Sprint 03 → A1   GGUF export                  [next, active queue]
-Sprint 04 → A2   Batch pipeline (collect→deploy)
-Sprint 05 → A3   Model registry + promote/rollback
-Sprint 06 → A5   Inference hardening + cost/SLO/canary
-Sprint 07 → A6a  JWT auth + tenant context
-Sprint 08 → A6b  Tenant-scoped persistence + audit
-        ↘
-         (parallel, opportunistic)
-         App Runner serving lane — cheap MVP demo host ($0–$5/mo)
+Sprint 03 → A1     GGUF export                                  ✅ shipped
+Sprint 04 → A2     Batch pipeline (collect→deploy)              ✅ shipped
+Sprint 05 → A3     Model registry + promote/rollback            ✅ shipped
+Sprint 06 →        Hardening hotfix                             [next, active queue]
+Sprint 07 →        Frontend production + App Runner serving
+Sprint 08 → A5     Inference hardening + cost/SLO/canary
+Sprint 09 → A6a    JWT auth + tenant context
+Sprint 10 → A6b    Tenant-scoped persistence + audit
 ```
+
+**Re-slicing rationale (2026-05-04):** an external code review surfaced two
+tracks the blueprint never covered — frontend production readiness and
+targeted security hardening (path traversal, wildcard CORS, in-memory
+job state). Sprints 06–07 are inserted to address them before A5 so we
+don't pile features onto an unhardened API or an unbuildable frontend.
+A5 pulls in job/run persistence (SQLite) so A6's Postgres switch
+becomes a *driver swap*, not a new layer.
 
 A4 is intentionally absent — that's the diffusion lane in the source blueprint, out of scope here.
 
@@ -65,10 +72,7 @@ A4 is intentionally absent — that's the diffusion lane in the source blueprint
 
 **Status:** Runner mechanics (state machine, atomic state writes, resume, hard-gate enforcement) and CLI shipped. Stage implementations land as a mix: `eval` and `deploy` are wired live (eval → `app.eval.run_eval`, deploy → A1's `merge_and_export`); `collect`, `forge`, `train` are thin stubs that surface artifacts but defer the real harvester/trainer wiring until each stage's input contract is finalized — TODOs in source.
 
-**Test execution caveat:** The 10-case test suite was written but could not be executed in this session because macOS TCC revoked Full Disk Access for Python on the Documents folder mid-session. Code reviewed by hand. Run locally to verify:
-```bash
-python3 -m pytest tests/test_batch_pipeline.py -v
-```
+**Test execution status:** All 10 cases verified green during the A3 session (full suite 273/273 once macOS TCC restored Python's Documents access). The hand-review-only caveat from the original A2 commit no longer applies.
 
 **Shipped**
 - `app/pipeline/runner.py` (~280 LoC) — `PipelineRunner` with `start_run` / `resume_run` / `execute`. Atomic write-then-rename via `os.replace` on `stage_status.json`. Per-stage idempotency keys (default = sha256 of manifest+name; override with `Stage.idempotency_key_fn`). Resume skips a stage only when prior status was COMPLETED *and* the current key matches the recorded one. Stage exceptions are caught, traceback persisted, pipeline halted. A passed stage that flips `gate_passed=False` halts the pipeline (this is how eval blocks deploy).
@@ -126,33 +130,104 @@ python3 -m pytest tests/test_batch_pipeline.py -v
 
 ---
 
-## Sprint 06 — A5: Inference hardening + cost/SLO/canary
+## Sprint 06 — Hardening hotfix (next, active queue)
+
+**Goal:** Close the security and build-correctness gaps surfaced by the 2026-05-04 external code review *before* exposing more API surface in A5 or attempting an MVP deploy. Small, defensive, mostly mechanical.
+
+**Source of findings:** external readiness audit on `develop` HEAD `573eda5`.
+
+**Deliverables**
+
+Security:
+- **Path allowlisting validator** (`app/security/paths.py`) — single helper used by `/v1/forge/ingest`, harvest endpoints, and the deploy stage's `output_dir`. Accepts a path only if it resolves under one of the configured allowlist roots (`data/uploads/`, `data/processed/`, `outputs/`). Rejects symlink escapes after `Path.resolve()`.
+- **CORS allowlist** — replace wildcard `allow_origins=["*"]` in `app/main.py` with an env-driven list (`VALONY_CORS_ORIGINS`, comma-separated). Default to `http://localhost:5173,http://127.0.0.1:5173` so dev still works out of the box.
+
+Frontend build:
+- Fix `import.meta.env` typing — add `frontend/src/vite-env.d.ts` declaring the project's `VITE_*` keys.
+- Remove the unused `CloseIcon` import in `frontend/src/components/ChatWidget.tsx`.
+- Add `eslint` + `@typescript-eslint/*` to `frontend/package.json` so `npm run lint` actually runs.
+
+CI:
+- `.github/workflows/ci.yml` — add a `frontend` job that runs `npm ci`, `npm run lint`, `npm run build`. Block merges on failure.
+
+Tests:
+- `tests/test_path_validator.py` — escape attempts (`..`, absolute paths outside allowlist, symlink redirects) all reject; happy paths under each allowlist root accept.
+- `tests/test_cors_config.py` — env-driven origin parsing + default-localhost fallback.
+
+**Acceptance gate**
+- ✅ All four mutating path-accepting endpoints reject paths outside their allowlist root (covered by tests).
+- ✅ Wildcard CORS gone from `app/main.py`; `allow_origins` resolves from env.
+- ✅ `npm run build` succeeds locally and in CI; `npm run lint` exits 0.
+- ✅ CI blocks on frontend build/lint failure.
+
+**Out of scope** (deferred to their proper sprints): auth (A6), tenant scoping (A6), persistence layer (A5), live pipeline stage wiring (A2 follow-up), inference manager → registry-PRODUCTION-only (A5).
+
+**Sizing:** ~1 day. No architectural decisions; everything is targeted plumbing.
+
+---
+
+## Sprint 07 — Frontend production + App Runner serving
+
+**Goal:** Make the frontend deployable and stand up the cheap MVP demo lane on AWS. Promotes the previously "opportunistic" App Runner sprint to a real slot now that S06 makes the build green and the API safe to expose.
+
+**Budget target:** $0–$5/mo (App Runner Auto Pause idle ≈ $3.30/mo provisioned-memory-only; active vCPU billed per request).
+
+**Deliverables — frontend serving model**
+- **Decision** (record in PR): FastAPI `StaticFiles` mount at `/` with SPA fallback (`/{full_path:path}` → `index.html`) **vs** S3 + CloudFront for the SPA + API on a separate origin.
+  - Default lean: **separate origins** (S3/CloudFront for SPA, App Runner for API). Cheaper, scales independently, lets the static side stay free-tier; App Runner stays single-purpose.
+  - StaticFiles mount path is the fallback if you'd rather have one container handle both (simpler ops, slightly more compute per request).
+- Implement chosen path. If separate origins: keep the existing Vite build, add an `npm run build && aws s3 sync dist/ s3://...` script. If StaticFiles: mount in `app/main.py` with the SPA fallback route.
+- **Dockerfile harden:** the current image copies `frontend/dist` but uvicorn doesn't serve it (assessment item 3). Either drop the copy (separate-origins path) or wire the StaticFiles mount.
+
+**Deliverables — App Runner**
+- `apprunner.yaml` at repo root — `runtime: python311`, build command, start command (`uvicorn app.main:app --host 0.0.0.0 --port 8000`), 0.25 vCPU / 0.5 GB, Auto Pause on.
+- Slimmed CPU-only Docker target (`Dockerfile.apprunner` or a new stage on the existing Dockerfile) — drop `torch`/`unsloth`/`vllm` extras, keep only what's needed for `VALONY_INFERENCE_BACKEND=ollama`.
+- IaC bits: `infra/apprunner-service.tf` or a one-shot bootstrap script (decide based on user pref).
+
+**Hard constraints**
+- App Runner has no GPU and no room for an in-process model. Generation MUST proxy to Ollama Cloud / OpenRouter / HF Inference. Never load a HF/vLLM model in this image.
+- `VALONY_CORS_ORIGINS` (from S06) must include the SPA origin (CloudFront or App Runner static path).
+
+**Acceptance gate**
+- ✅ `frontend/dist` served correctly in production (whichever serving model is chosen) — manual smoke + a CI check that fetches `/` from a built container.
+- ✅ End-to-end `curl https://<apprunner>/healthz` and SPA loads in a browser.
+- ✅ Monthly bill under $5 for a week of pitch-deck-volume traffic.
+
+**Sizing:** 1 sprint. Frontend serving model decision is the only non-mechanical step.
+
+---
+
+## Sprint 08 — A5: Inference hardening + cost/SLO/canary
 
 **Goal:** Defend runtime quality and unit economics during rollouts.
 
+**Re-scoped (2026-05-04):** pulls in job + run persistence (SQLite-backed) so A5's SLO/cost/canary surfaces have a durable place to read/write from. The current `job_registry` dict in `app/main.py` loses state on restart and diverges across workers — A5 closes that without waiting for A6's Postgres switch.
+
 **Deliverables**
+- `app/persistence/store.py` — abstract `JobStore` + `RunStore` interfaces with a SQLite default backend. Schema migrations in `app/persistence/migrations/`. `app/main.py` switches `job_registry` to `JobStore`; `app/pipeline/runner.py` mirrors run state into `RunStore` alongside the JSONL.
 - `app/cache/semantic.py` — Redis-backed semantic cache with in-memory fallback (env-gated)
 - `app/observability/cost.py` — per-request token/cost accounting
 - `app/observability/slo.py` — latency / error-rate / quality-probe evaluator
 - Canary % routing in `app/inference/manager.py` with auto-abort triggers
-- `tests/test_semantic_cache.py`
+- `app/inference/manager.py` adapter resolution switches from "scan `outputs/<domain>/`" to "load the registry's PRODUCTION row" (closes the A3 follow-up loop).
+- `tests/test_semantic_cache.py`, `tests/test_persistence.py`, `tests/test_canary_routing.py`
 - Metric artifacts: `outputs/metrics/{slo,cost,canary}_<timestamp>.json`
 
 **Auto-abort triggers:** latency p95 > threshold, error rate spike > threshold, quality probe fail.
 
-**Acceptance gate:** equal or better quality at lower or stable latency/cost in a canary window.
+**Acceptance gate:** equal or better quality at lower or stable latency/cost in a canary window; jobs survive a `uvicorn` restart.
 
-**Sizing:** 4–5 days. Depends on A3 (canary routes between registered model versions).
+**Sizing:** 5–6 days (4–5 base + 1 for persistence). Depends on A3 (canary routes between registered model versions) and S06 (CORS / path validators in place before exposing cost/SLO endpoints).
 
 ---
 
-## Sprint 07 — A6a: JWT auth + tenant context
+## Sprint 09 — A6a: JWT auth + tenant context
 
 **Deliverables**
 - `app/auth/jwt.py` — token validation, claims extraction
 - `app/auth/middleware.py` — FastAPI middleware that attaches `tenant_id` to request state
 - `tests/test_auth_jwt.py`
-- All existing endpoints accept (and require, except `/healthz`) a valid token
+- All existing endpoints accept (and require, except `/healthz`) a valid token. Includes the new registry endpoints from A3 (`/v1/registry/promote`, `/v1/registry/rollback`) and S08's cost/SLO surfaces.
 
 **Acceptance gate:** every protected endpoint rejects missing/invalid tokens; tenant id is available to handlers.
 
@@ -160,36 +235,34 @@ python3 -m pytest tests/test_batch_pipeline.py -v
 
 ---
 
-## Sprint 08 — A6b: Tenant-scoped persistence + audit
+## Sprint 10 — A6b: Tenant-scoped persistence + audit
 
 **Deliverables**
-- `app/memory/store.py` — Postgres / pgvector store, tenant-scoped queries
-- `app/audit/logging.py` — append-only audit events tagged with model version + user/tenant
-- `tests/test_tenant_isolation.py` — tenant A cannot read tenant B's records
-- Audit artifacts: `outputs/audit/events_<date>.jsonl`
+- `app/persistence/postgres.py` — Postgres / pgvector backend implementing the `JobStore` + `RunStore` interfaces from S08. **Driver swap, not a new layer** — A5's SQLite is the dev/MVP default, A6 makes Postgres the production option.
+- `app/registry/postgres_backend.py` — Postgres backend for `ModelRegistry` (replaces the JSONL files for production deploys; JSONL stays as the dev default).
+- `app/memory/store.py` — pgvector tenant-scoped vector memory.
+- `app/audit/logging.py` — append-only audit events tagged with model version + user/tenant.
+- `tests/test_tenant_isolation.py` — tenant A cannot read tenant B's records.
+- Audit artifacts: `outputs/audit/events_<date>.jsonl` (file backend) or audit table (Postgres backend).
 
-**Acceptance gate:** tenant isolation verified in automated tests; auditable request trace exists for every chat/training/promote action.
+**Acceptance gate:** tenant isolation verified in automated tests; auditable request trace exists for every chat/training/promote/rollback action; A5's job/run persistence and A3's registry both serve from Postgres in the production profile.
 
-**Sizing:** 5–7 days. Heaviest sprint — Postgres provisioning + migration story land here.
+**Sizing:** 5–7 days. Heaviest sprint — Postgres provisioning + migration story land here. Lighter than originally scoped because the *interfaces* already exist (S08 created them); A6 only swaps the backend.
 
 ---
 
-## Parallel sprint (opportunistic) — App Runner serving lane
+## A2 follow-up — live pipeline stage wiring
 
-**Trigger:** when an MVP pitch-deck demo lands or a Trial-tier user asks for a hosted URL.
-**Budget target:** $0–$5/mo.
+**Goal:** Replace the `collect / forge / train` stubs in `app/pipeline/stages.py` with real wiring to the existing modules so `scripts/batch_pipeline.py --domain X` runs end-to-end without TODOs.
 
-**Architecture (proxy-only model serving)**
-- Frontend: `frontend/` Vite build → S3 + CloudFront (or Amplify Hosting). Effectively $0 at demo volumes.
-- Backend: slimmed CPU-only Docker image of `app/` with `VALONY_INFERENCE_BACKEND=ollama`, dropping `torch`/`unsloth`/`vllm` extras. Generations proxy to Ollama Cloud (already production via `app/inference/ollama_backend.py`).
-- Runtime: AWS App Runner, 0.25 vCPU / 0.5 GB, Auto Pause enabled. Idle ≈ provisioned-memory only (~$3.30/mo); active vCPU billed per request.
-- IaC: `apprunner.yaml` + `Dockerfile.apprunner` (or a multi-stage `apprunner` target on the existing `Dockerfile`).
+**Deliverables**
+- `collect_fn` — route to YouTube / arXiv / code harvesters per `ctx.config['collect']`. Schema decision: union-tagged dict per harvester type.
+- `forge_fn` — call `app.data_forge.build_dataset(...)` with collect outputs. Surface samples count + dataset path.
+- `train_fn` — instantiate the right trainer class per `ctx.config['method']` (SFT/DPO/ORPO/KTO/GRPO), call `.train()`, surface adapter path + final loss.
+- `configs/domains/*.yaml` schema additions for the new collect/forge/train knobs.
+- `tests/test_pipeline_stages_live.py` — integration-style tests with monkeypatched harvesters / data_forge / trainers.
 
-**Hard constraint:** App Runner has no GPU and no room for an in-process model. The whole lane only works if generation is offloaded — never load a HF/vLLM model in this image.
-
-**Out of scope (would blow the budget):** GPU inference, vLLM, in-process model hosting, fine-grained autoscaling beyond Auto Pause.
-
-**Sizing:** ~1 sprint when triggered. Not on the critical path.
+**Sizing:** 1–2 sprints' worth, splittable into one PR per stage. Not on the critical path for S06–S10 — slot whenever a real pipeline run is needed.
 
 ---
 
@@ -198,8 +271,10 @@ python3 -m pytest tests/test_batch_pipeline.py -v
 The Lane A adoption is complete when:
 
 1. A1 — adapters export to GGUF and round-trip in smoke tests; rollback pointer maintained.
-2. A2 — full pipeline runs unattended and recovers from mid-stage failure.
+2. A2 — full pipeline runs unattended and recovers from mid-stage failure (live stages wired, no TODO stubs).
 3. A3 — every promotion requires explicit quality + lineage gates; rollback by id works.
-4. A5 — canary rollout + cost/SLO controls protect runtime reliability and economics.
-5. A6 — tenant isolation enforced; auditable traces tagged with model version and user/tenant.
-6. `docs/ARCHITECTURE_AND_ROADMAP.md` synced with the implemented state.
+4. S06 — path traversal closed; CORS allowlisted; frontend builds in CI.
+5. S07 — frontend served correctly in production; App Runner demo lane reachable under $5/mo.
+6. A5 — canary rollout + cost/SLO controls protect runtime reliability and economics; jobs/runs durable.
+7. A6 — tenant isolation enforced; auditable traces tagged with model version and user/tenant; Postgres backend live.
+8. `docs/ARCHITECTURE_AND_ROADMAP.md` synced with the implemented state.
