@@ -75,6 +75,11 @@ class AuditAction(str, Enum):
     HARVEST_CODE = "harvest_code"
     BUILD_DATASET = "build_dataset"
 
+    # Multimodal pipeline
+    MULTIMODAL_INDEX = "multimodal_index"
+    MULTIMODAL_SEARCH = "multimodal_search"
+    MULTIMODAL_RAG = "multimodal_rag"
+
     # Domain configs
     DOMAIN_CONFIG_CREATE = "domain_config_create"
 

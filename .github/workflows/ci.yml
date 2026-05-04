@@ -81,3 +81,38 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  postgres-tests:
+    name: Postgres backend (testcontainers)
+    runs-on: ubuntu-latest
+    # GitHub Actions ubuntu runners ship with Docker preinstalled, so
+    # testcontainers can spin up real Postgres containers. This job
+    # exercises app/persistence/postgres.py against the same tenant
+    # isolation guarantees the SQLite path covers, but on the actual
+    # production-profile driver.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install test deps + Postgres extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-test.txt
+          pip install 'psycopg[binary]>=3.1' 'psycopg-pool>=3.2' 'testcontainers[postgres]>=4.7'
+
+      - name: Run Postgres backend tests
+        run: pytest tests/test_persistence_postgres.py -v
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Postgres backend test summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: postgres:16-alpine via testcontainers-python" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Driver: psycopg3 + psycopg-pool" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Scope: tests/test_persistence_postgres.py (12 cases)" >> "$GITHUB_STEP_SUMMARY"

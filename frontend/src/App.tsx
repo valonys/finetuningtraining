@@ -3,6 +3,7 @@ import Health from "./components/Health";
 import Domains from "./components/Domains";
 import DataForge from "./components/DataForge";
 import Train from "./components/Train";
+import Multimodal from "./components/Multimodal";
 import ChatWidget from "./components/ChatWidget";
 import DocsSidebar from "./components/DocsSidebar";
 
@@ -10,6 +11,7 @@ const TABS = [
   { id: "health",    label: "Health" },
   { id: "domains",   label: "Domains" },
   { id: "dataforge", label: "Data Forge" },
+  { id: "multimodal", label: "Multimodal" },
   { id: "train",     label: "Train" },
 ] as const;
 
@@ -70,6 +72,7 @@ export default function App() {
         {tab === "health"    && <Health />}
         {tab === "domains"   && <Domains />}
         {tab === "dataforge" && <DataForge />}
+        {tab === "multimodal" && <Multimodal />}
         {tab === "train"     && <Train />}
       </main>
 

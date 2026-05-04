@@ -15,6 +15,10 @@ import type {
   ForgeBuildResponse,
   HealthResponse,
   JobStatus,
+  MultimodalIndexRequest,
+  MultimodalIndexResponse,
+  MultimodalRAGResponse,
+  MultimodalSearchResponse,
   TrainingJobRequest,
   UploadListResponse,
   UploadResponse,
@@ -152,6 +156,44 @@ export const forgeDeleteUpload = (filename: string) =>
 
 export const forgeClearUploads = () =>
   call<{ deleted: number }>("/v1/forge/uploads", { method: "DELETE" });
+
+// ── Multimodal pipeline ──────────────────────────────────────
+export const multimodalIndex = (body: MultimodalIndexRequest) =>
+  call<MultimodalIndexResponse>("/v1/multimodal/index", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const multimodalSearch = (body: {
+  query: string;
+  collection: string;
+  top_k?: number;
+  source_type?: import("./types").MultimodalSourceType | null;
+  embedding_dim?: number;
+  embed_provider?: "hash" | "openai_compat";
+}) =>
+  call<MultimodalSearchResponse>("/v1/multimodal/search", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const multimodalRag = (body: {
+  query: string;
+  collection: string;
+  top_k?: number;
+  source_type?: import("./types").MultimodalSourceType | null;
+  embedding_dim?: number;
+  embed_provider?: "hash" | "openai_compat";
+  generate?: boolean;
+  domain_config_name?: string;
+  temperature?: number;
+  max_new_tokens?: number;
+  max_context_chars?: number;
+}) =>
+  call<MultimodalRAGResponse>("/v1/multimodal/rag", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 
 // ── Training jobs ────────────────────────────────────────────
 export const createTrainingJob = (body: TrainingJobRequest) =>

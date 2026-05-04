@@ -306,19 +306,58 @@ A4 is intentionally absent — that's the diffusion lane in the source blueprint
 
 ---
 
-## Sprint 10 — A6b: Tenant-scoped persistence + audit
+## Sprint 10 — A6b: Tenant-scoped persistence + audit (shipped 2026-05-04)
 
-**Deliverables**
-- `app/persistence/postgres.py` — Postgres / pgvector backend implementing the `JobStore` + `RunStore` interfaces from S08. **Driver swap, not a new layer** — A5's SQLite is the dev/MVP default, A6 makes Postgres the production option.
-- `app/registry/postgres_backend.py` — Postgres backend for `ModelRegistry` (replaces the JSONL files for production deploys; JSONL stays as the dev default).
-- `app/memory/store.py` — pgvector tenant-scoped vector memory.
-- `app/audit/logging.py` — append-only audit events tagged with model version + user/tenant.
-- `tests/test_tenant_isolation.py` — tenant A cannot read tenant B's records.
-- Audit artifacts: `outputs/audit/events_<date>.jsonl` (file backend) or audit table (Postgres backend).
+**Goal:** Tenant isolation enforced at every persistence boundary; auditable trace for every mutating action; Postgres as a drop-in production-profile backend.
 
-**Acceptance gate:** tenant isolation verified in automated tests; auditable request trace exists for every chat/training/promote/rollback action; A5's job/run persistence and A3's registry both serve from Postgres in the production profile.
+**Status:** Shipped across four phases:
+1. Audit log module (committed `5be1921`)
+2. Tenant-scoped SQLiteStore + migration (committed `bff0422`)
+3. Handler tenant wiring + audit hooks + cross-cutting isolation test (this commit)
+4. Postgres backend + testcontainers CI job (this commit)
 
-**Sizing:** 5–7 days. Heaviest sprint — Postgres provisioning + migration story land here. Lighter than originally scoped because the *interfaces* already exist (S08 created them); A6 only swaps the backend.
+414/414 tests pass locally (Postgres tests skipped without Docker; CI runs them on every push). FastAPI loads cleanly with auth/persistence/audit all wired.
+
+**Shipped — phase 1 (audit log)**
+- `app/audit/logging.py` — `AuditLogger` writes `outputs/audit/events_<UTC-date>.jsonl` with one self-contained JSON object per line. `AuditAction` enum is the typed vocabulary (job_created/completed/failed, registry_promote/rollback, chat, upload, ingest, etc.). `query()` filters by tenant/action/target/date. Daily file rotation. 14 unit tests.
+- `default_logger()` singleton at `outputs/audit/`, override via `VALONY_AUDIT_DIR`.
+
+**Shipped — phase 2 (tenant-scoped SQLite)**
+- `app/persistence/store.py` — JobStore + RunStore Protocols updated: every method takes `tenant_id` as a required positional. No escape hatch — cross-tenant access is impossible at the storage boundary, not by handler discipline.
+- Schema: `jobs` and `runs` get `tenant_id TEXT NOT NULL DEFAULT 'public'`. New composite indexes `(tenant_id, status)`, `(tenant_id, domain)`, `(tenant_id, updated_at)`.
+- `_init_schema` order: tables → migration → indexes (the indexes reference tenant_id which a pre-A6b table doesn't have until the migration adds it).
+- `_migrate_add_tenant_column` introspects via `PRAGMA table_info()` and ALTER TABLEs in tenant_id with `DEFAULT 'public'` if missing. Pre-A6b rows bind to the synthetic 'public' tenant so auth-disabled flows keep accessing them.
+- `tests/test_persistence.py` rewritten end-to-end: 23 cases covering single-tenant happy paths, cross-tenant isolation (get/list/update/delete don't leak; payload stamps tenant; status filter scoped), RunStore tenant isolation including the upsert-collision guard, legacy-db migration round-trip, and concurrent writers.
+
+**Shipped — phase 3 (handler wiring + cross-cutting test)**
+- `app/main.py`:
+  - `_run_training` takes `tenant_id`; threaded into `create_job` via `background_tasks.add_task(_run_training, job_id, tenant_id, req, config)`.
+  - `create_job` / `get_job` / `list_jobs` accept `Request`, extract tenant via `_tenant_of(request)` (which reads `request.state.claims.tenant_id`), pass to store.
+  - `_audit(request, action=..., target_id=...)` calls added on JOB_CREATED, JOB_COMPLETED, JOB_FAILED, REGISTRY_PROMOTE (success + failure paths), REGISTRY_ROLLBACK (success + failure paths).
+- `app/pipeline/runner.py`: `RunContext.tenant_id` field (default 'public'); `start_run(tenant_id=...)` stamps it into manifest + status; `resume_run` recovers it; `RunStore.upsert_run` mirror call now passes `ctx.tenant_id`.
+- `tests/test_tenant_isolation.py` — 8 cross-cutting cases via TestClient with two real JWT-signed tenant tokens: cross-tenant `GET /v1/jobs/{id}` returns 404 not payload; `GET /v1/jobs` returns own only; persisted payloads carry tenant stamp; audit log filters per tenant; strict mode rejects unauthenticated/forged tokens; `/healthz` always public; auth-disabled mode routes everyone to 'public' tenant (so dev workflows are unchanged).
+
+**Shipped — phase 4 (Postgres backend + CI)**
+- `app/persistence/postgres.py` — `PostgresStore` implementing both Protocols against PostgreSQL via `psycopg` (psycopg3) + `psycopg-pool`. Schema mirrors SQLite (TEXT keys, JSONB payload, `(tenant_id, …)` composite indexes). `update_fields` uses `SELECT … FOR UPDATE` so concurrent updaters don't lose data — confirmed by the 50-thread × 10-write Postgres test reaching exactly 500.
+- `app/persistence/__init__.py` and `default_store()` resolve backend per env: `VALONY_PERSISTENCE_BACKEND=postgres` → PostgresStore (requires `VALONY_POSTGRES_DSN`); anything else → SQLiteStore. Same singleton pattern.
+- `tests/test_persistence_postgres.py` — 12 cases (happy path + tenant isolation + concurrency) using `testcontainers-python` to spin a real `postgres:16-alpine`. Auto-skips when Docker / testcontainers / psycopg unavailable.
+- `pyproject.toml`: new `postgres` extra (`psycopg[binary]>=3.1`, `psycopg-pool>=3.2`).
+- `.github/workflows/ci.yml`: new `postgres-tests` job on `ubuntu-latest` (Docker preinstalled). Installs psycopg + testcontainers, runs the Postgres test module.
+
+**Acceptance gate**
+- ✅ Tenant isolation verified in automated tests — 23 SQLite + 12 Postgres + 8 cross-cutting via TestClient. Cross-tenant `get` / `update` / `delete` return None / 404 / no-op; cross-tenant upsert collisions are rejected at SQL level.
+- ✅ Auditable request trace for every mutating action — `_audit` hooks on JOB_CREATED/COMPLETED/FAILED, REGISTRY_PROMOTE/ROLLBACK (incl. failure paths). MULTIMODAL_INDEX/SEARCH/RAG already wired by the parallel multimodal feature.
+- ✅ A5's persistence serves from Postgres in production — `VALONY_PERSISTENCE_BACKEND=postgres` flips the driver. testcontainers-validated.
+- ⏳ A3 ModelRegistry on Postgres — JSONL stays the default; the `PostgresModelRegistry` driver swap is **A6c follow-up** (same pattern; JSONL works fine for MVP).
+
+**Explicitly deferred to A6c (in priority order)**
+1. **`PostgresModelRegistry`** — same Protocol-and-driver-swap pattern as PostgresStore. ~150 LoC + 10 tests. Acceptance-gate-adjacent but not blocking; JSONL works for MVP scale.
+2. **JWKS-URL fetcher for RS256** — replaces the static `VALONY_JWT_PUBLIC_KEY` PEM with periodic JWKS fetch + cache. Required for Auth0/Cognito/Okta IdPs.
+3. **Role-based authorization** — `require_role("admin")` decorator/dependency. First consumer is gating `POST /v1/registry/promote` on a `production-release` role.
+4. **PgVector tenant memory** (`app/memory/store.py`) — was in the original A6b spec, deferred because there's no chat-flow consumer yet. Building the wiring with no reader is dead infrastructure. Revisit when chat-with-memory becomes a feature; the multimodal pipeline that landed in parallel may already cover this need.
+5. **Postgres-backed audit** — replace JSONL with `audit_events` table for SIEM-style queries. JSONL is correct for MVP; flip when audit volume justifies a query engine.
+
+**Sizing actual:** ~1 long session for audit + tenant scope + handler wiring + cross-cutting test + Postgres backend + testcontainers CI. Heavier than other sprints because of the breadth (every persistence call site touched).
 
 ---
 

@@ -293,18 +293,34 @@ _default_store: SQLiteStore | None = None
 _default_lock = threading.Lock()
 
 
-def default_store() -> SQLiteStore:
-    """Return a process-wide SQLiteStore at the default path. Override
-    via ``VALONY_PERSISTENCE_PATH`` env (e.g. for tests / containers
-    with a different mount layout)."""
+def default_store():
+    """Return a process-wide store, resolved per env:
+
+      VALONY_PERSISTENCE_BACKEND=postgres → PostgresStore (A6b
+        production profile). Requires psycopg-pool + a DSN at
+        VALONY_POSTGRES_DSN.
+      anything else (default) → SQLiteStore at
+        VALONY_PERSISTENCE_PATH (default outputs/.persistence/store.db).
+
+    Both implementations satisfy the JobStore + RunStore Protocols,
+    so call sites don't care which is active."""
     global _default_store
     if _default_store is None:
         with _default_lock:
             if _default_store is None:
-                path = os.environ.get(
-                    "VALONY_PERSISTENCE_PATH",
-                    "outputs/.persistence/store.db",
-                )
-                _default_store = SQLiteStore(db_path=path)
-                logger.info(f"📦 Persistence store initialized at {path}")
+                backend = os.environ.get("VALONY_PERSISTENCE_BACKEND", "sqlite").lower()
+                if backend == "postgres":
+                    from .postgres import PostgresStore
+                    _default_store = PostgresStore()
+                    logger.info(
+                        f"📦 Persistence store initialized: postgres "
+                        f"(dsn={_default_store.dsn.split('@')[-1] if '@' in _default_store.dsn else 'set'})"
+                    )
+                else:
+                    path = os.environ.get(
+                        "VALONY_PERSISTENCE_PATH",
+                        "outputs/.persistence/store.db",
+                    )
+                    _default_store = SQLiteStore(db_path=path)
+                    logger.info(f"📦 Persistence store initialized: sqlite ({path})")
     return _default_store

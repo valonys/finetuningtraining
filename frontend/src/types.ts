@@ -192,3 +192,63 @@ export interface DocsSource {
   article_id: string;
   score: number;
 }
+
+export type MultimodalSourceType =
+  | "text"
+  | "audio"
+  | "image"
+  | "slide"
+  | "video"
+  | "document"
+  | "code";
+
+export interface MultimodalIndexRequest {
+  paths: string[];
+  collection: string;
+  source_type?: MultimodalSourceType | null;
+  ocr_engine?: string | null;
+  chunk_target_chars?: number;
+  chunk_overlap_chars?: number;
+  embedding_dim?: number;
+  embed_provider?: "hash" | "openai_compat";
+}
+
+export interface MultimodalIndexResponse {
+  tenant_id: string;
+  collection: string;
+  records_indexed: number;
+  chunks_indexed: number;
+  stats: {
+    tenant_id: string;
+    collection: string;
+    chunk_count: number;
+    by_modality: Record<string, number>;
+  };
+}
+
+export interface MultimodalSearchResult {
+  chunk_id: string;
+  record_id: string;
+  text: string;
+  score: number;
+  source_type: string;
+  source_uri: string;
+  title?: string | null;
+  start_time_s?: number | null;
+  end_time_s?: number | null;
+  page?: number | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface MultimodalSearchResponse {
+  tenant_id: string;
+  collection: string;
+  query: string;
+  results: MultimodalSearchResult[];
+}
+
+export interface MultimodalRAGResponse extends MultimodalSearchResponse {
+  answer: string;
+  sources: string[];
+  context: string;
+}

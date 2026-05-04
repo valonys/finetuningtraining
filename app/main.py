@@ -833,6 +833,214 @@ async def forge_build(req: ForgeBuildRequest):
 
 
 # ──────────────────────────────────────────────────────────────
+# Enterprise multimodal pipeline — index / search / RAG
+# ──────────────────────────────────────────────────────────────
+@app.post("/v1/multimodal/index", response_model=MultimodalIndexResponse)
+async def multimodal_index(req: MultimodalIndexRequest, request: Request):
+    """Index uploaded/processed files into a tenant-scoped multimodal collection."""
+    tenant_id = _tenant_from_request(request, req.tenant_id)
+    safe_paths = _validated_paths(req.paths)
+    pipeline = _multimodal_pipeline(
+        tenant_id=tenant_id,
+        collection=req.collection,
+        chunk_target_chars=req.chunk_target_chars,
+        chunk_overlap_chars=req.chunk_overlap_chars,
+        embedding_dim=req.embedding_dim,
+        embed_provider=req.embed_provider,
+    )
+
+    try:
+        forge = DataForge(ocr_engine=req.ocr_engine)
+        parsed = forge.ingest(safe_paths)
+        records = records_from_data_forge(
+            parsed,
+            tenant_id=tenant_id,
+            collection=req.collection,
+            source_type_override=_modality(req.source_type),
+        )
+        chunks = await asyncio.to_thread(pipeline.index_records, records)
+        stats = pipeline.vector_store.stats(tenant_id=tenant_id, collection=req.collection)
+    except Exception as exc:
+        _audit(
+            request,
+            action=AuditAction.MULTIMODAL_INDEX,
+            target_id=req.collection,
+            success=False,
+            metadata={"error": str(exc), "paths": safe_paths},
+        )
+        raise HTTPException(400, f"multimodal index failed: {exc}")
+
+    _audit(
+        request,
+        action=AuditAction.MULTIMODAL_INDEX,
+        target_id=req.collection,
+        metadata={
+            "paths": safe_paths,
+            "records_indexed": len(records),
+            "chunks_indexed": len(chunks),
+            "embed_provider": req.embed_provider,
+        },
+    )
+    return MultimodalIndexResponse(
+        tenant_id=tenant_id,
+        collection=req.collection,
+        records_indexed=len(records),
+        chunks_indexed=len(chunks),
+        stats=stats,
+    )
+
+
+@app.post("/v1/multimodal/search", response_model=MultimodalSearchResponse)
+async def multimodal_search(req: MultimodalSearchRequest, request: Request):
+    tenant_id = _tenant_from_request(request, req.tenant_id)
+    pipeline = _multimodal_pipeline(
+        tenant_id=tenant_id,
+        collection=req.collection,
+        embedding_dim=req.embedding_dim,
+        embed_provider=req.embed_provider,
+    )
+    try:
+        results = await asyncio.to_thread(
+            pipeline.search,
+            req.query,
+            top_k=req.top_k,
+            source_type=_modality(req.source_type),
+            tenant_id=tenant_id,
+            collection=req.collection,
+        )
+    except Exception as exc:
+        _audit(
+            request,
+            action=AuditAction.MULTIMODAL_SEARCH,
+            target_id=req.collection,
+            success=False,
+            metadata={"error": str(exc), "query": req.query},
+        )
+        raise HTTPException(400, f"multimodal search failed: {exc}")
+
+    _audit(
+        request,
+        action=AuditAction.MULTIMODAL_SEARCH,
+        target_id=req.collection,
+        metadata={"query": req.query, "top_k": req.top_k, "results": len(results)},
+    )
+    return MultimodalSearchResponse(
+        tenant_id=tenant_id,
+        collection=req.collection,
+        query=req.query,
+        results=[_mm_result(r) for r in results],
+    )
+
+
+@app.post("/v1/multimodal/rag", response_model=MultimodalRAGResponse)
+async def multimodal_rag(req: MultimodalRAGRequest, request: Request):
+    tenant_id = _tenant_from_request(request, req.tenant_id)
+    pipeline = _multimodal_pipeline(
+        tenant_id=tenant_id,
+        collection=req.collection,
+        embedding_dim=req.embedding_dim,
+        embed_provider=req.embed_provider,
+    )
+    context_builder = ContextBuilder(max_chars=req.max_context_chars)
+
+    def _generate(prompt: str) -> str:
+        engine = get_inference_engine(DEFAULT_BASE_MODEL, backend=DEFAULT_INFERENCE_BACKEND)
+        from app.templates import get_template_for
+
+        template = get_template_for(engine.base_model_id)
+        system_prompt = (
+            "You are an enterprise multimodal RAG assistant. Use only the cited "
+            "context. Preserve citations. Say when the context is insufficient."
+        )
+        if req.domain_config_name and req.domain_config_name != "base":
+            try:
+                cfg = load_domain_config(req.domain_config_name)
+                system_prompt = cfg.get("system_prompt", system_prompt)
+            except FileNotFoundError:
+                pass
+        formatted = template.format_prompt_only(system=system_prompt, instruction=prompt)
+        resp = engine.generate_full(
+            GenerationRequest(
+                prompt=formatted,
+                domain_name=req.domain_config_name or "base",
+                temperature=req.temperature,
+                max_new_tokens=req.max_new_tokens,
+            )
+        )
+        return resp.text
+
+    try:
+        if req.generate:
+            rag_engine = RAGEngine(
+                pipeline,
+                generator=_generate,
+                context_builder=context_builder,
+            )
+            answer = await asyncio.to_thread(
+                rag_engine.answer,
+                req.query,
+                top_k=req.top_k,
+                source_type=_modality(req.source_type),
+            )
+            response_text = answer.answer
+            sources = answer.sources
+            context = answer.context
+            results = answer.results
+        else:
+            results = await asyncio.to_thread(
+                pipeline.search,
+                req.query,
+                top_k=req.top_k,
+                source_type=_modality(req.source_type),
+                tenant_id=tenant_id,
+                collection=req.collection,
+            )
+            context, sources = context_builder.build(results)
+            response_text = (
+                "Generation disabled. Returning cited multimodal context only."
+                if context
+                else "No indexed multimodal context matched the query."
+            )
+    except Exception as exc:
+        _audit(
+            request,
+            action=AuditAction.MULTIMODAL_RAG,
+            target_id=req.collection,
+            success=False,
+            metadata={"error": str(exc), "query": req.query, "generate": req.generate},
+        )
+        raise HTTPException(400, f"multimodal rag failed: {exc}")
+
+    _audit(
+        request,
+        action=AuditAction.MULTIMODAL_RAG,
+        target_id=req.collection,
+        metadata={
+            "query": req.query,
+            "top_k": req.top_k,
+            "results": len(results),
+            "generate": req.generate,
+        },
+    )
+    return MultimodalRAGResponse(
+        tenant_id=tenant_id,
+        collection=req.collection,
+        query=req.query,
+        answer=response_text,
+        sources=sources,
+        context=context,
+        results=[_mm_result(r) for r in results],
+    )
+
+
+@app.get("/v1/multimodal/{collection}/stats", response_model=MultimodalStatsResponse)
+async def multimodal_stats(collection: str, request: Request, tenant_id: str | None = None):
+    resolved_tenant = _tenant_from_request(request, tenant_id)
+    stats = _multimodal_store().stats(tenant_id=resolved_tenant, collection=collection)
+    return MultimodalStatsResponse(**stats)
+
+
+# ──────────────────────────────────────────────────────────────
 # Training jobs
 # ──────────────────────────────────────────────────────────────
 _TRAINER_CLASSES = {
@@ -844,11 +1052,15 @@ _TRAINER_CLASSES = {
 }
 
 
-async def _run_training(job_id: str, req: TrainingJobRequest, config: Dict[str, Any]):
+async def _run_training(
+    job_id: str, tenant_id: str, req: TrainingJobRequest, config: Dict[str, Any]
+):
     # A5: live state lives in the SQLite store so a uvicorn restart
     # leaves the record intact. Field mutations route through
     # _update_job which patches the persisted payload atomically.
-    _update_job(job_id, status="training")
+    # A6b: tenant_id captured at request-time and threaded into the
+    # background task so the trainer's writes stay scoped.
+    _update_job(job_id, tenant_id, status="training")
 
     # The trainer's LossHistoryCallback appends to a list reference we
     # hand it. We keep that list local to the running task and flush
@@ -867,7 +1079,7 @@ async def _run_training(job_id: str, req: TrainingJobRequest, config: Dict[str, 
                 fields["current_loss"] = float(last)
         # Throttle persistence: flush every Nth call instead of every call.
         if len(loss_history) % flush_every == 0:
-            _update_job(job_id, **fields)
+            _update_job(job_id, tenant_id, **fields)
 
     try:
         TrainerCls = _TRAINER_CLASSES[req.training_method]
@@ -889,6 +1101,7 @@ async def _run_training(job_id: str, req: TrainingJobRequest, config: Dict[str, 
 
         _update_job(
             job_id,
+            tenant_id,
             status="completed",
             progress=1.0,
             final_loss=result.get("final_loss"),
@@ -898,20 +1111,51 @@ async def _run_training(job_id: str, req: TrainingJobRequest, config: Dict[str, 
             adapter_path=result.get("adapter_path"),
             loss_history=loss_history,
         )
-        logger.info(f"[{job_id}] ✅ Training complete")
+        # A6b: audit terminal job state (background tasks have no
+        # request, so we log directly via default_logger() rather
+        # than the request-scoped _audit helper).
+        try:
+            default_logger().log(
+                tenant_id=tenant_id,
+                action=AuditAction.JOB_COMPLETED,
+                target_id=job_id,
+                metadata={
+                    "method": req.training_method,
+                    "final_loss": result.get("final_loss"),
+                    "adapter_path": result.get("adapter_path"),
+                },
+            )
+        except Exception as exc:
+            logger.warning(f"audit log on JOB_COMPLETED failed: {exc}")
+        logger.info(f"[{job_id}] ✅ Training complete (tenant={tenant_id})")
 
     except Exception as e:
         _update_job(
             job_id,
+            tenant_id,
             status="failed",
             error_message=str(e),
             loss_history=loss_history,
         )
-        logger.exception(f"[{job_id}] ❌ Training failed")
+        try:
+            default_logger().log(
+                tenant_id=tenant_id,
+                action=AuditAction.JOB_FAILED,
+                target_id=job_id,
+                success=False,
+                metadata={"method": req.training_method, "error": str(e)},
+            )
+        except Exception as exc:
+            logger.warning(f"audit log on JOB_FAILED failed: {exc}")
+        logger.exception(f"[{job_id}] ❌ Training failed (tenant={tenant_id})")
 
 
 @app.post("/v1/jobs/create", response_model=JobStatus, status_code=202)
-async def create_job(req: TrainingJobRequest, background_tasks: BackgroundTasks):
+async def create_job(
+    request: Request,
+    req: TrainingJobRequest,
+    background_tasks: BackgroundTasks,
+):
     if not req.dataset_path and not req.hf_dataset:
         raise HTTPException(422, "Provide dataset_path or hf_dataset")
     if req.dataset_path and req.hf_dataset:
@@ -929,6 +1173,7 @@ async def create_job(req: TrainingJobRequest, background_tasks: BackgroundTasks)
     if req.training_method not in _TRAINER_CLASSES:
         raise HTTPException(422, f"Unsupported training method: {req.training_method}")
 
+    tenant_id = _tenant_of(request)
     job_id = str(uuid.uuid4())
     job = JobStatus(
         job_id=job_id,
@@ -937,23 +1182,29 @@ async def create_job(req: TrainingJobRequest, background_tasks: BackgroundTasks)
         method=req.training_method,
         dataset_source="huggingface" if req.hf_dataset else "local",
     )
-    _store_job(job)
-    background_tasks.add_task(_run_training, job_id, req, config)
-    logger.info(f"Job {job_id} queued | method={req.training_method}")
+    _store_job(job, tenant_id)
+    background_tasks.add_task(_run_training, job_id, tenant_id, req, config)
+    _audit(
+        request,
+        action=AuditAction.JOB_CREATED,
+        target_id=job_id,
+        metadata={"method": req.training_method, "domain": req.domain_config_name},
+    )
+    logger.info(f"Job {job_id} queued | tenant={tenant_id} method={req.training_method}")
     return job
 
 
 @app.get("/v1/jobs/{job_id}", response_model=JobStatus)
-async def get_job(job_id: str):
-    job = _get_job(job_id)
+async def get_job(job_id: str, request: Request):
+    job = _get_job(job_id, _tenant_of(request))
     if job is None:
         raise HTTPException(404, "Job not found")
     return job
 
 
 @app.get("/v1/jobs", response_model=List[JobStatus])
-async def list_jobs():
-    return _list_jobs()
+async def list_jobs(request: Request):
+    return _list_jobs(_tenant_of(request))
 
 
 # ──────────────────────────────────────────────────────────────
@@ -995,39 +1246,76 @@ async def get_registry_version(model_version: str):
 
 
 @app.post("/v1/registry/promote", response_model=ModelVersion)
-async def promote_model(req: RegistryPromoteRequest):
+async def promote_model(req: RegistryPromoteRequest, request: Request):
     """Move a model version to a new status. Promoting to PRODUCTION
     auto-rolls-back any existing production for the same domain."""
     target = _coerce_status(req.to_status)
     try:
-        return _registry().promote(
+        result = _registry().promote(
             req.model_version,
             to_status=target,
             actor=req.actor,
             reason=req.reason,
         )
     except UnknownVersion:
+        _audit(request, action=AuditAction.REGISTRY_PROMOTE,
+               target_id=req.model_version, success=False,
+               metadata={"to_status": req.to_status, "reason": "unknown_version"})
         raise HTTPException(404, f"unknown model_version: {req.model_version}")
     except InvalidTransition as exc:
+        _audit(request, action=AuditAction.REGISTRY_PROMOTE,
+               target_id=req.model_version, success=False,
+               metadata={"to_status": req.to_status, "reason": str(exc)})
         raise HTTPException(409, str(exc))
+    _audit(
+        request,
+        action=AuditAction.REGISTRY_PROMOTE,
+        target_id=req.model_version,
+        metadata={
+            "to_status": req.to_status,
+            "actor": req.actor,
+            "promotion_reason": req.reason,
+        },
+    )
+    return result
 
 
 @app.post("/v1/registry/rollback", response_model=RollbackResult)
-async def rollback_model(req: RegistryRollbackRequest):
+async def rollback_model(req: RegistryRollbackRequest, request: Request):
     """Demote the current production for ``domain`` to ROLLED_BACK and
     promote a replacement (explicit ``target_version`` or auto-picked
     most recent STAGING / ROLLED_BACK version)."""
     try:
-        return _registry().rollback(
+        result = _registry().rollback(
             domain=req.domain,
             target_version=req.target_version,
             actor=req.actor,
             reason=req.reason,
         )
     except UnknownVersion as exc:
+        _audit(request, action=AuditAction.REGISTRY_ROLLBACK,
+               target_id=req.domain, success=False,
+               metadata={"target_version": req.target_version, "reason": "unknown_version"})
         raise HTTPException(404, f"unknown model_version: {exc.args[0]}")
     except InvalidTransition as exc:
+        _audit(request, action=AuditAction.REGISTRY_ROLLBACK,
+               target_id=req.domain, success=False,
+               metadata={"target_version": req.target_version, "reason": str(exc)})
         raise HTTPException(409, str(exc))
+    _audit(
+        request,
+        action=AuditAction.REGISTRY_ROLLBACK,
+        target_id=req.domain,
+        metadata={
+            "rolled_back": result.rolled_back.model_version,
+            "new_production": (
+                result.new_production.model_version if result.new_production else None
+            ),
+            "actor": req.actor,
+            "rollback_reason": req.reason,
+        },
+    )
+    return result
 
 
 # ──────────────────────────────────────────────────────────────

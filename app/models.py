@@ -205,6 +205,99 @@ class ForgeBuildResponse(BaseModel):
     sources: List[str]
 
 
+# ── Multimodal pipeline ───────────────────────────────────────
+class MultimodalIndexRequest(BaseModel):
+    paths: List[str] = Field(
+        default_factory=list,
+        description="Server-side paths to ingest. Must resolve under uploads, processed, or outputs.",
+    )
+    tenant_id: Optional[str] = Field(
+        default=None,
+        description="Optional tenant override. Defaults to JWT/dev tenant.",
+    )
+    collection: str = Field(default="default", min_length=1, max_length=128)
+    source_type: Optional[Literal[
+        "text", "audio", "image", "slide", "video", "document", "code",
+    ]] = Field(
+        default=None,
+        description="Force all indexed records to this modality. Omit for Data Forge auto-detection.",
+    )
+    ocr_engine: Optional[str] = None
+    chunk_target_chars: int = Field(default=1200, ge=200, le=8000)
+    chunk_overlap_chars: int = Field(default=160, ge=0, le=2000)
+    embedding_dim: int = Field(default=384, ge=16, le=4096)
+    embed_provider: Literal["hash", "openai_compat"] = "hash"
+
+
+class MultimodalIndexResponse(BaseModel):
+    tenant_id: str
+    collection: str
+    records_indexed: int
+    chunks_indexed: int
+    stats: Dict[str, Any]
+
+
+class MultimodalSearchRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    tenant_id: Optional[str] = None
+    collection: str = Field(default="default", min_length=1, max_length=128)
+    top_k: int = Field(default=8, ge=1, le=50)
+    source_type: Optional[Literal[
+        "text", "audio", "image", "slide", "video", "document", "code",
+    ]] = None
+    embedding_dim: int = Field(default=384, ge=16, le=4096)
+    embed_provider: Literal["hash", "openai_compat"] = "hash"
+
+
+class MultimodalSearchResult(BaseModel):
+    chunk_id: str
+    record_id: str
+    text: str
+    score: float
+    source_type: str
+    source_uri: str
+    title: Optional[str] = None
+    start_time_s: Optional[float] = None
+    end_time_s: Optional[float] = None
+    page: Optional[int] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class MultimodalSearchResponse(BaseModel):
+    tenant_id: str
+    collection: str
+    query: str
+    results: List[MultimodalSearchResult]
+
+
+class MultimodalRAGRequest(MultimodalSearchRequest):
+    generate: bool = Field(
+        default=False,
+        description="If true, call the configured inference backend. If false, return cited context only.",
+    )
+    domain_config_name: str = "base"
+    temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    max_new_tokens: int = Field(default=800, ge=1, le=4096)
+    max_context_chars: int = Field(default=12000, ge=1000, le=60000)
+
+
+class MultimodalRAGResponse(BaseModel):
+    tenant_id: str
+    collection: str
+    query: str
+    answer: str
+    sources: List[str]
+    context: str
+    results: List[MultimodalSearchResult]
+
+
+class MultimodalStatsResponse(BaseModel):
+    tenant_id: str
+    collection: str
+    chunk_count: int
+    by_modality: Dict[str, int]
+
+
 # ── Domain configs (user-defined per engagement) ───────────────
 class DomainConfigCreateRequest(BaseModel):
     """Create a new domain config YAML under configs/domains/<name>.yaml."""
