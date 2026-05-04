@@ -130,39 +130,44 @@ A4 is intentionally absent — that's the diffusion lane in the source blueprint
 
 ---
 
-## Sprint 06 — Hardening hotfix (next, active queue)
+## Sprint 06 — Hardening hotfix (shipped 2026-05-04)
 
-**Goal:** Close the security and build-correctness gaps surfaced by the 2026-05-04 external code review *before* exposing more API surface in A5 or attempting an MVP deploy. Small, defensive, mostly mechanical.
+**Goal:** Close the security and build-correctness gaps surfaced by the 2026-05-04 external code review *before* exposing more API surface in A5 or attempting an MVP deploy.
+
+**Status:** Shipped. Backend: 20 new unit tests green; full Python suite 293/293, no regressions; FastAPI loads cleanly with the new CORS resolver. Frontend: code-level fixes applied (build verification waits for next CI run since `npm` isn't available in this session — the CI job we added will gate it).
 
 **Source of findings:** external readiness audit on `develop` HEAD `573eda5`.
 
-**Deliverables**
+**Shipped — security**
+- `app/security/paths.py` — `validated_path(raw, *, allowlist_roots=None, must_exist=False)` resolves the path via `Path.resolve(strict=False)` then verifies it lives under one of the allowlist roots. Symlink escapes are caught because we resolve *before* checking. Default allowlist reads `VALONY_UPLOADS_DIR` / `VALONY_PROCESSED_DIR` / `VALONY_OUTPUTS_DIR` fresh on each call so test monkeypatches work.
+- `app/security/cors.py` — `resolve_cors_origins()` returns the env-driven allowlist, falling back to `http://localhost:5173,http://127.0.0.1:5173` when `VALONY_CORS_ORIGINS` is unset. Empty / whitespace-only env also falls back (an empty list would block ALL origins, breaking dev silently).
+- `app/security/__init__.py` — public re-exports.
+- `app/main.py` — wildcard CORS replaced; `_cors_origins` logged at boot. New `_validated_paths(paths)` helper used by `/v1/forge/ingest` and `/v1/forge/build_dataset`. `/v1/forge/harvest/code` validates `req.path` (must_exist=True) and `req.output_dir` directly. All path rejections surface as 422 with a clear actionable message.
+- `app/pipeline/stages.py` — `deploy_fn` validates `output_dir` before `merge_and_export` writes any bytes; failure becomes a clean `StageResult(status=FAILED)` with the rejection reason.
 
-Security:
-- **Path allowlisting validator** (`app/security/paths.py`) — single helper used by `/v1/forge/ingest`, harvest endpoints, and the deploy stage's `output_dir`. Accepts a path only if it resolves under one of the configured allowlist roots (`data/uploads/`, `data/processed/`, `outputs/`). Rejects symlink escapes after `Path.resolve()`.
-- **CORS allowlist** — replace wildcard `allow_origins=["*"]` in `app/main.py` with an env-driven list (`VALONY_CORS_ORIGINS`, comma-separated). Default to `http://localhost:5173,http://127.0.0.1:5173` so dev still works out of the box.
+**Shipped — frontend build**
+- `frontend/src/vite-env.d.ts` — declares `ImportMetaEnv` with `VITE_API_URL?: string`. Closes the build error on `import.meta.env` access in `frontend/src/api.ts`.
+- `frontend/src/components/ChatWidget.tsx` — removed the unused `CloseIcon` definition (the source of one of the two TS strict-mode build failures).
+- `frontend/package.json` — added `eslint`, `@eslint/js`, `typescript-eslint` to devDeps. Updated `lint` script to drop the eslint-9-incompatible `--ext` flag.
+- `frontend/eslint.config.js` — flat-config setup (eslint 9), errors-only ruleset. `no-unused-vars` enabled with `^_` ignore convention. Permissive on `no-explicit-any` since the streaming meta blobs intentionally use it.
 
-Frontend build:
-- Fix `import.meta.env` typing — add `frontend/src/vite-env.d.ts` declaring the project's `VITE_*` keys.
-- Remove the unused `CloseIcon` import in `frontend/src/components/ChatWidget.tsx`.
-- Add `eslint` + `@typescript-eslint/*` to `frontend/package.json` so `npm run lint` actually runs.
+**Shipped — CI**
+- `.github/workflows/ci.yml` — new `frontend` job: `npm ci` → `npm run lint` → `npm run build` on Node 20 with npm cache. Runs in parallel with the existing `smoke-tests` matrix; both must pass before merge.
 
-CI:
-- `.github/workflows/ci.yml` — add a `frontend` job that runs `npm ci`, `npm run lint`, `npm run build`. Block merges on failure.
-
-Tests:
-- `tests/test_path_validator.py` — escape attempts (`..`, absolute paths outside allowlist, symlink redirects) all reject; happy paths under each allowlist root accept.
-- `tests/test_cors_config.py` — env-driven origin parsing + default-localhost fallback.
+**Shipped — tests**
+- `tests/test_path_validator.py` (11 cases) — every default root accepts; root-itself accepts; `..` traversal rejects; absolute outside-allowlist rejects; symlink escape rejects (skipped on platforms without symlinks); empty path rejects; `must_exist` raises FileNotFoundError; explicit allowlist override works; default allowlist re-reads env on each call; relative path resolves against cwd.
+- `tests/test_cors_config.py` (9 cases) — unset / empty / whitespace env all fall back to dev defaults; single + multiple origins parsed; whitespace around entries trimmed; empty entries dropped; all-empty-after-trim falls back; the dev-defaults list is fresh per call (mutation can't poison a later call).
 
 **Acceptance gate**
-- ✅ All four mutating path-accepting endpoints reject paths outside their allowlist root (covered by tests).
-- ✅ Wildcard CORS gone from `app/main.py`; `allow_origins` resolves from env.
-- ✅ `npm run build` succeeds locally and in CI; `npm run lint` exits 0.
-- ✅ CI blocks on frontend build/lint failure.
+- ✅ Path-accepting mutating endpoints reject out-of-allowlist paths (`/v1/forge/ingest`, `/v1/forge/build_dataset`, `/v1/forge/harvest/code`, deploy stage `output_dir`).
+- ✅ Wildcard CORS gone; `allow_origins` resolves from env. Verified at FastAPI boot.
+- ⏳ `npm run build` succeeds — pending first CI run (this session can't invoke npm).
+- ✅ CI gate added — `frontend` job blocks on lint or build failure.
 
 **Out of scope** (deferred to their proper sprints): auth (A6), tenant scoping (A6), persistence layer (A5), live pipeline stage wiring (A2 follow-up), inference manager → registry-PRODUCTION-only (A5).
 
-**Sizing:** ~1 day. No architectural decisions; everything is targeted plumbing.
+**Risks / open**
+- ⏳ The CI `frontend` job's first run will tell us if there are additional lint warnings in existing code that the new eslint config flags. If so, expect a small follow-up to either fix them or relax specific rules. Permissive baseline (no `no-explicit-any`, allow `_`-prefixed unused) should keep this minimal.
 
 ---
 

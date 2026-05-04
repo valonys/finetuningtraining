@@ -102,6 +102,11 @@ from app.registry import (
     UnknownVersion,
     default_registry,
 )
+from app.security import (
+    PathValidationError,
+    resolve_cors_origins,
+    validated_path,
+)
 from app.uploads import (
     UploadError,
     clear_uploads,
@@ -182,12 +187,32 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS allowlist resolved from VALONY_CORS_ORIGINS (comma-separated).
+# Default keeps dev origins (Vite at :5173) so local dev works untouched;
+# production deploys MUST set the env var explicitly. Wildcard is gone
+# as of S06 — exposing this API to "*" was an obvious foot-gun once
+# auth lands in A6.
+_cors_origins = resolve_cors_origins()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+logger.info(f"CORS allowlist: {_cors_origins}")
+
+
+def _validated_paths(paths: list[str]) -> list[str]:
+    """S06 chokepoint for endpoints that take user-supplied paths.
+    Re-raises as 422 so the client gets a clear actionable error."""
+    out: list[str] = []
+    for raw in paths:
+        try:
+            out.append(str(validated_path(raw)))
+        except PathValidationError as exc:
+            raise HTTPException(422, f"path rejected: {exc}")
+    return out
 
 
 # ──────────────────────────────────────────────────────────────
@@ -518,15 +543,25 @@ async def forge_harvest_code(req: CodeHarvestRequest):
     from app.harvesters.code import CodeHarvester
 
     try:
+        safe_path = str(validated_path(req.path, must_exist=True))
+        safe_output_dir = (
+            str(validated_path(req.output_dir)) if req.output_dir else None
+        )
+    except PathValidationError as exc:
+        raise HTTPException(422, f"path rejected: {exc}")
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+
+    try:
         harvester = CodeHarvester()
         report = await asyncio.to_thread(
             harvester.harvest_directory,
-            req.path,
+            safe_path,
             strategy=req.strategy,
             source_label=req.source_label,
             min_lines=req.min_lines,
             max_lines=req.max_lines,
-            output_dir=req.output_dir,
+            output_dir=safe_output_dir,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -549,9 +584,10 @@ async def forge_harvest_code(req: CodeHarvestRequest):
 # ──────────────────────────────────────────────────────────────
 @app.post("/v1/forge/ingest")
 async def forge_ingest(req: ForgeIngestRequest):
+    safe_paths = _validated_paths(req.paths)
     forge = DataForge(ocr_engine=req.ocr_engine)
     try:
-        records = forge.ingest(req.paths)
+        records = forge.ingest(safe_paths)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {
@@ -571,9 +607,10 @@ async def forge_ingest(req: ForgeIngestRequest):
 
 @app.post("/v1/forge/build_dataset", response_model=ForgeBuildResponse)
 async def forge_build(req: ForgeBuildRequest):
+    safe_paths = _validated_paths(req.paths)
     forge = DataForge()
     try:
-        records = forge.ingest(req.paths)
+        records = forge.ingest(safe_paths)
         # Normalise "auto" sentinel to None so the DatasetBuilder
         # auto-resolves the template from the base model id.
         template_override = (

@@ -174,6 +174,17 @@ def deploy_fn(ctx: RunContext) -> StageResult:
     deploy_cfg = ctx.config.get("deploy", {}) or {}
     output_dir = deploy_cfg.get("output_dir") or f"outputs/{ctx.domain}/artifacts"
 
+    # S06: validate output_dir lives under the allowlist before we
+    # write any artifact bytes there.
+    from app.security import PathValidationError, validated_path
+    try:
+        output_dir = str(validated_path(output_dir))
+    except PathValidationError as exc:
+        return StageResult(
+            status=StageStatus.FAILED,
+            error=f"deploy output_dir rejected: {exc}",
+        )
+
     from app.trainers.export import merge_and_export
     export_result = merge_and_export(
         base_model_id=base_model_id,
