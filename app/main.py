@@ -78,6 +78,8 @@ from app.models import (
     ForgeIngestRequest,
     HealthResponse,
     JobStatus,
+    RegistryPromoteRequest,
+    RegistryRollbackRequest,
     TrainingJobRequest,
     UploadListResponse,
     UploadResponse,
@@ -90,6 +92,15 @@ from app.models import (
     ArxivHarvestedPaperInfo,
     CodeHarvestRequest,
     CodeHarvestResponse,
+)
+from app.registry import (
+    InvalidTransition,
+    ModelRegistry,
+    ModelStatus,
+    ModelVersion,
+    RollbackResult,
+    UnknownVersion,
+    default_registry,
 )
 from app.uploads import (
     UploadError,
@@ -723,6 +734,80 @@ async def get_job(job_id: str):
 @app.get("/v1/jobs", response_model=List[JobStatus])
 async def list_jobs():
     return list(job_registry.values())
+
+
+# ──────────────────────────────────────────────────────────────
+# Model registry (A3) — promote / rollback control
+# ──────────────────────────────────────────────────────────────
+def _registry() -> ModelRegistry:
+    """Indirection so tests can monkeypatch the registry root."""
+    return default_registry()
+
+
+def _coerce_status(value: str) -> ModelStatus:
+    try:
+        return ModelStatus(value)
+    except ValueError:
+        raise HTTPException(
+            422,
+            f"invalid status '{value}': expected one of "
+            f"{[s.value for s in ModelStatus]}",
+        )
+
+
+@app.get("/v1/registry", response_model=List[ModelVersion])
+async def list_registry(
+    domain: str | None = None,
+    status: str | None = None,
+):
+    """List registered model versions, newest first. Optional filters
+    by ``domain`` and ``status``."""
+    status_enum = _coerce_status(status) if status is not None else None
+    return _registry().list(domain=domain, status=status_enum)
+
+
+@app.get("/v1/registry/{model_version}", response_model=ModelVersion)
+async def get_registry_version(model_version: str):
+    try:
+        return _registry().get(model_version)
+    except UnknownVersion:
+        raise HTTPException(404, f"unknown model_version: {model_version}")
+
+
+@app.post("/v1/registry/promote", response_model=ModelVersion)
+async def promote_model(req: RegistryPromoteRequest):
+    """Move a model version to a new status. Promoting to PRODUCTION
+    auto-rolls-back any existing production for the same domain."""
+    target = _coerce_status(req.to_status)
+    try:
+        return _registry().promote(
+            req.model_version,
+            to_status=target,
+            actor=req.actor,
+            reason=req.reason,
+        )
+    except UnknownVersion:
+        raise HTTPException(404, f"unknown model_version: {req.model_version}")
+    except InvalidTransition as exc:
+        raise HTTPException(409, str(exc))
+
+
+@app.post("/v1/registry/rollback", response_model=RollbackResult)
+async def rollback_model(req: RegistryRollbackRequest):
+    """Demote the current production for ``domain`` to ROLLED_BACK and
+    promote a replacement (explicit ``target_version`` or auto-picked
+    most recent STAGING / ROLLED_BACK version)."""
+    try:
+        return _registry().rollback(
+            domain=req.domain,
+            target_version=req.target_version,
+            actor=req.actor,
+            reason=req.reason,
+        )
+    except UnknownVersion as exc:
+        raise HTTPException(404, f"unknown model_version: {exc.args[0]}")
+    except InvalidTransition as exc:
+        raise HTTPException(409, str(exc))
 
 
 # ──────────────────────────────────────────────────────────────

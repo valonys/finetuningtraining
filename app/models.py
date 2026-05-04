@@ -282,6 +282,31 @@ class DomainInfo(BaseModel):
     method: Optional[str] = None
 
 
+# ── Model registry (A3) ───────────────────────────────────────
+class RegistryPromoteRequest(BaseModel):
+    """POST /v1/registry/promote — move a model_version to a new status."""
+    model_version: str
+    to_status: str = Field(
+        ...,
+        description="Target status: 'staging' | 'production' | 'rolled_back'",
+    )
+    actor: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class RegistryRollbackRequest(BaseModel):
+    """POST /v1/registry/rollback — demote the current production for a domain."""
+    domain: str
+    target_version: Optional[str] = Field(
+        default=None,
+        description="Optional version to promote as the replacement. If omitted, "
+                    "the registry auto-picks the most recently updated "
+                    "STAGING / ROLLED_BACK version for the domain.",
+    )
+    actor: Optional[str] = None
+    reason: Optional[str] = None
+
+
 # ── Health ─────────────────────────────────────────────────────
 class HealthResponse(BaseModel):
     status: str

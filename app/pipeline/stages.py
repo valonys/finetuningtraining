@@ -150,11 +150,17 @@ def eval_fn(ctx: RunContext) -> StageResult:
 
 
 def deploy_fn(ctx: RunContext) -> StageResult:
-    """Export a deployable GGUF artifact via A1's merge_and_export.
+    """Export a deployable GGUF artifact via A1's merge_and_export and
+    register it in the A3 model registry as a CANDIDATE.
 
     Reads adapter path from the train stage's outputs and base model id
     from the train output / domain config. Honors ``ctx.config['deploy']``
     for output dir + quant + llama.cpp path overrides.
+
+    Registry lineage threaded into the candidate record:
+      * dataset_manifest_path  ← forge stage's ``dataset_path``
+      * eval_report_path       ← eval stage's ``report.report_path``
+      * artifact_sha256        ← export's ``sha256``
     """
     train_out = ctx.stage_outputs.get("train", {})
     adapter_path = train_out.get("adapter_path")
@@ -169,7 +175,7 @@ def deploy_fn(ctx: RunContext) -> StageResult:
     output_dir = deploy_cfg.get("output_dir") or f"outputs/{ctx.domain}/artifacts"
 
     from app.trainers.export import merge_and_export
-    result = merge_and_export(
+    export_result = merge_and_export(
         base_model_id=base_model_id,
         adapter_path=adapter_path,
         output_dir=output_dir,
@@ -177,7 +183,37 @@ def deploy_fn(ctx: RunContext) -> StageResult:
         llama_cpp_path=deploy_cfg.get("llama_cpp_path"),
         artifact_name=deploy_cfg.get("artifact_name"),
     )
-    return StageResult(artifacts=result)
+
+    # ── Register in A3 model registry ──────────────────────────────
+    forge_out = ctx.stage_outputs.get("forge", {})
+    eval_out = ctx.stage_outputs.get("eval", {})
+    eval_report = eval_out.get("report") if isinstance(eval_out, dict) else None
+    eval_report_path = (
+        eval_report.get("report_path") if isinstance(eval_report, dict) else None
+    )
+
+    try:
+        from app.registry import default_registry
+        registry = default_registry()
+        version = registry.register_candidate(
+            domain=ctx.domain,
+            base_model_id=base_model_id,
+            adapter_path=adapter_path,
+            artifact_path=export_result.get("gguf_path"),
+            artifact_sha256=export_result.get("sha256"),
+            dataset_manifest_path=forge_out.get("dataset_path"),
+            eval_report_path=eval_report_path,
+            extra={"run_id": ctx.run_id, "quant": export_result.get("quant")},
+        )
+        export_result["model_version"] = version.model_version
+        export_result["registry_status"] = version.status.value
+    except Exception as exc:
+        # Registration is best-effort: a registry hiccup must not throw
+        # away a successful export. Surface the failure in artifacts.
+        logger.warning(f"⚠️  registry registration failed: {exc}")
+        export_result["registry_error"] = f"{type(exc).__name__}: {exc}"
+
+    return StageResult(artifacts=export_result)
 
 
 # ──────────────────────────────────────────────────────────────

@@ -92,22 +92,37 @@ python3 -m pytest tests/test_batch_pipeline.py -v
 
 ---
 
-## Sprint 05 — A3: Model registry + promote/rollback
+## Sprint 05 — A3: Model registry + promote/rollback (shipped 2026-05-04)
 
 **Goal:** Every deployed model is traceable and rollback-safe by version id.
 
-**Deliverables**
-- `app/registry/schemas.py` — Pydantic models for the version record
-- `app/registry/model_registry.py` — JSONL-backed registry first; DB-backed deferred to A6
-- New endpoints in `app/main.py`: `GET /v1/registry`, `POST /v1/registry/promote`, `POST /v1/registry/rollback`
-- `tests/test_model_registry.py` — CRUD + promotion lifecycle + rollback
-- Persistent state: `outputs/registry/{model_versions.jsonl, promotion_events.jsonl}`
+**Status:** Shipped. 14 new tests green; full suite 273/273 (no regressions). FastAPI app loads with all 4 registry routes wired. A2's deploy stage now auto-registers exported artifacts as CANDIDATE.
 
-**Schema fields (minimum):** `model_version`, `base_model_id`, `adapter_path`, `dataset_manifest_path`, `eval_report_path`, `artifact_sha256`, `status` ∈ {candidate, staging, production, rolled_back}, `promoted_from`.
+**Shipped**
+- `app/registry/schemas.py` — `ModelStatus` enum, `ModelVersion`, `PromotionEvent`, `RollbackResult` (Pydantic).
+- `app/registry/model_registry.py` (~270 LoC) — `ModelRegistry` with append-only JSONL storage at `outputs/registry/{model_versions.jsonl, promotion_events.jsonl}`. Materializes current state by replaying the version log; events are first-class history. State machine enforces `candidate → staging → production` plus `→ rolled_back` exit and `rolled_back → staging` re-attempt path. Promoting a second version to PRODUCTION atomically demotes the prior one with an auto-reason event. `rollback(domain, target_version=None)` either uses an explicit replacement or auto-picks the most recently updated STAGING / ROLLED_BACK candidate.
+- `app/registry/__init__.py` — public exports (`ModelRegistry`, `ModelStatus`, `ModelVersion`, `PromotionEvent`, `RollbackResult`, `InvalidTransition`, `UnknownVersion`, `default_registry`).
+- `app/models.py` — `RegistryPromoteRequest`, `RegistryRollbackRequest` API request models.
+- `app/main.py` — 4 endpoints:
+  - `GET  /v1/registry?domain=&status=` → `List[ModelVersion]`
+  - `GET  /v1/registry/{model_version}` → `ModelVersion`
+  - `POST /v1/registry/promote` → `ModelVersion`
+  - `POST /v1/registry/rollback` → `RollbackResult`
+  - 404 on unknown version, 409 on invalid transition, 422 on bad status string.
+- `app/pipeline/stages.py` — `deploy_fn` now calls `register_candidate(...)` after `merge_and_export` succeeds, threading dataset manifest path (forge stage), eval report path (eval stage), artifact sha256 (export). Registration is best-effort: a registry hiccup logs a warning + populates `registry_error` in artifacts but does not fail the deploy stage (the GGUF on disk is still valid).
+- `tests/test_model_registry.py` — 14 cases covering register / list filters / full lifecycle / auto-demote on second promotion / rollback with target / rollback auto-pick / no-production-to-rollback / invalid transitions / unknown version / append-only durability across fresh registry instance / re-attempt after rollback / target-must-be-staging-or-rolled-back / id generation without artifact sha.
 
-**Acceptance gate:** every deployed model maps to dataset manifest + eval report + artifact hash; rollback by version id works.
+**Acceptance gate**
+- ✅ Every deployed model maps to dataset manifest + eval report + artifact hash — `deploy_fn` threads all three into `register_candidate`.
+- ✅ Rollback by version id works — `test_rollback_with_explicit_target_promotes_replacement`.
+- ✅ Auto-rollback on prod replacement — `test_promoting_second_to_production_auto_demotes_first`.
 
-**Sizing:** 3 days. Depends on A1 + A2.
+**Open follow-ups**
+- ⏳ Multi-process safety: append-only JSONL is safe for line-sized writes < `PIPE_BUF`, but multi-writer concurrency relies on single-process discipline. A6's Postgres switch removes this caveat.
+- ⏳ Registry surfaces in the React frontend (`Domains.tsx` / new `Registry.tsx` panel). Not in A3 scope.
+- ⏳ `inference/manager.py` currently scans `outputs/<domain>/` for adapters; switching it to "load only the registry's PRODUCTION row" is the natural follow-up that closes the loop between registry and serving.
+
+**Sizing actual:** ~1 session for schemas + registry + endpoints + deploy wiring + tests.
 
 ---
 
