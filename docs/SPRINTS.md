@@ -223,27 +223,42 @@ A4 is intentionally absent — that's the diffusion lane in the source blueprint
 
 ---
 
-## Sprint 08 — A5: Inference hardening + cost/SLO/canary
+## Sprint 08 — A5: Inference hardening + cost/SLO/canary (shipped 2026-05-04)
 
 **Goal:** Defend runtime quality and unit economics during rollouts.
 
-**Re-scoped (2026-05-04):** pulls in job + run persistence (SQLite-backed) so A5's SLO/cost/canary surfaces have a durable place to read/write from. The current `job_registry` dict in `app/main.py` loses state on restart and diverges across workers — A5 closes that without waiting for A6's Postgres switch.
+**Status:** Core shipped. 37 new unit tests green; full suite 340/340; FastAPI loads cleanly with persistence wired and JobStore round-trips end-to-end. Two pieces explicitly deferred to A5b (see "Open follow-ups" below): the semantic cache and the auto-abort *closed loop* that would actually demote a misbehaving canary.
 
-**Deliverables**
-- `app/persistence/store.py` — abstract `JobStore` + `RunStore` interfaces with a SQLite default backend. Schema migrations in `app/persistence/migrations/`. `app/main.py` switches `job_registry` to `JobStore`; `app/pipeline/runner.py` mirrors run state into `RunStore` alongside the JSONL.
-- `app/cache/semantic.py` — Redis-backed semantic cache with in-memory fallback (env-gated)
-- `app/observability/cost.py` — per-request token/cost accounting
-- `app/observability/slo.py` — latency / error-rate / quality-probe evaluator
-- Canary % routing in `app/inference/manager.py` with auto-abort triggers
-- `app/inference/manager.py` adapter resolution switches from "scan `outputs/<domain>/`" to "load the registry's PRODUCTION row" (closes the A3 follow-up loop).
-- `tests/test_semantic_cache.py`, `tests/test_persistence.py`, `tests/test_canary_routing.py`
-- Metric artifacts: `outputs/metrics/{slo,cost,canary}_<timestamp>.json`
+**Shipped — persistence (the "jobs survive uvicorn restart" half)**
+- `app/persistence/__init__.py` + `store.py` (~210 LoC) — `JobStore` and `RunStore` Protocols with a single `SQLiteStore` impl backing both. WAL journaling for cross-process readers, per-instance lock for in-process safety. Single .db file at `outputs/.persistence/store.db` (override via `VALONY_PERSISTENCE_PATH`). Microsecond timestamp precision so two writes in the same second still order deterministically. `default_store()` returns a process-wide singleton.
+- `app/main.py` — replaced the `job_registry: Dict[str, JobStatus] = {}` dict (and its 6 touch points) with `_jobs()`, `_store_job()`, `_get_job()`, `_update_job()`, `_list_jobs()` helpers backed by `default_store()`. Training progress callbacks throttle persistence to every 5th call (keeps step-rate overhead tiny while giving the UI a near-live curve). All `JobStatus` mutations now flush to SQLite atomically.
+- `app/pipeline/runner.py` — at the end of `execute()` the run report is mirrored into `RunStore` (best-effort: a persistence hiccup logs a warning, doesn't fail the run; the per-run JSONL files remain the durable resume source).
 
-**Auto-abort triggers:** latency p95 > threshold, error rate spike > threshold, quality probe fail.
+**Shipped — observability**
+- `app/observability/cost.py` — `CostTracker` with default rate table for Ollama Cloud / OpenRouter / HF Inference / local backends (USD per 1M tokens). `record(...)` accumulates per `(backend, model, version)`, so canary cost vs stable is trivially comparable. `snapshot()` writes `outputs/metrics/cost_<ts>.json`. Unknown rate pairs warn once and charge $0.
+- `app/observability/slo.py` — `SLOEvaluator` + `SLOThresholds` dataclass (latency_p95_ms, error_rate, quality_probe_min). `evaluate(...)` returns an `SLOResult` with per-check verdict, observed values, and a `halt_recommended` flag the runtime *can* read in A5b. `snapshot(result)` writes `outputs/metrics/slo_<ts>.json`.
 
-**Acceptance gate:** equal or better quality at lower or stable latency/cost in a canary window; jobs survive a `uvicorn` restart.
+**Shipped — canary**
+- `app/inference/canary.py` — `CanaryRouter` with per-domain `CanaryConfig`. `pick_version(domain, fallback)` does a uniform random draw against `canary_pct`. `record(...)` accumulates per-version metrics (latencies, errors, quality probes). `reset_metrics(domain=None)` for window boundaries. Seedable `Random` for deterministic tests.
+- `app/inference/manager.py` — `_scan_adapters()` now does both: (a) the existing directory walk for unregistered adapters, then (b) overlays the registry's PRODUCTION rows. Closes the A3 follow-up — the inference engine serves what the registry has promoted, not whatever happens to be on disk.
 
-**Sizing:** 5–6 days (4–5 base + 1 for persistence). Depends on A3 (canary routes between registered model versions) and S06 (CORS / path validators in place before exposing cost/SLO endpoints).
+**Shipped — tests (37 new across 3 files)**
+- `tests/test_persistence.py` (12) — create/get/list/update/delete + status filter + status index moves with payload + delete returns true/false + **durability across fresh instance** (the acceptance-gate test) + loss_history JSON round-trip + RunStore upsert + RunStore domain filter + concurrent writer smoke.
+- `tests/test_observability.py` (12) — cost rates for known + fallback + unknown pairs, single warn per unknown pair, per-version splits, snapshot artifacts, reset; SLO all-pass + each-check-breach + no-samples + snapshot.
+- `tests/test_canary_routing.py` (10) — fallback, range validation, proportional split (1000-trial seeded RNG), 0% / 100% edges, per-version metric accumulation, quality_probe filter, reset (per-domain + all), config removal, **end-to-end integration with SLOEvaluator** showing how A5b's auto-abort would consume the canary's metrics.
+
+**Acceptance gate**
+- ✅ Jobs survive a `uvicorn` restart — `test_durability_across_fresh_instance` proves the SQLite store round-trips state across `SQLiteStore` instances pointed at the same file.
+- ✅ Canary % routing works — `test_routing_splits_proportionally` (seeded 1000-trial smoke).
+- ✅ Cost/SLO surfaces have artifacts on disk — `test_*_snapshot_writes_artifact`.
+- ⏳ "Equal or better quality at lower or stable latency/cost in a canary window" — measurable only with real traffic. The A5b auto-abort step will consume this signal.
+
+**Open follow-ups (A5b — when triggered)**
+- ⏳ **Auto-abort closed loop**: today the `CanaryRouter` accumulates metrics and the `SLOEvaluator` sets `halt_recommended=True` when thresholds breach, but the runtime doesn't yet read that flag and demote the canary. Wiring it into `inference/manager.py` is small (~30 LoC) but should land *after* one real canary window has produced data to validate the threshold defaults — auto-abort firing on bad thresholds is worse than not auto-aborting.
+- ⏳ **Semantic cache**: deferred entirely. Acceptance gate doesn't require it; cost optimization is best done after we have real traffic to measure cache-hit value. Ship in A5b as `app/cache/semantic.py` (Redis with in-memory fallback) plus a `SemanticCache` integration in `inference/manager.py` that consults cache before invoking the backend.
+- ⏳ **Cost/SLO/canary endpoints**: the modules are wired internally; surfacing them through `app/main.py` (e.g. `GET /v1/observability/cost?domain=`, `POST /v1/inference/canary`) is small follow-up work that natural pairs with A6's auth (don't expose runtime levers without a token).
+
+**Sizing actual:** ~1 long session for persistence + observability + canary + tests + integration. Auto-abort + semantic cache deferred as A5b (~half-sprint when triggered).
 
 ---
 

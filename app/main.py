@@ -105,6 +105,7 @@ from app.registry import (
     UnknownVersion,
     default_registry,
 )
+from app.persistence import default_store
 from app.security import (
     PathValidationError,
     resolve_cors_origins,
@@ -130,7 +131,35 @@ from app.trainers import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-job_registry: Dict[str, JobStatus] = {}
+# A5: jobs persist to SQLite via the default store so they survive a
+# uvicorn restart. The dict-based job_registry was removed; everything
+# routes through ``_jobs`` (instantiated lazily so tests can override
+# VALONY_PERSISTENCE_PATH before first access).
+def _jobs():
+    return default_store()
+
+
+def _job_to_status(payload: dict[str, Any]) -> JobStatus:
+    """Hydrate a stored payload back into a JobStatus model."""
+    return JobStatus.model_validate(payload)
+
+
+def _store_job(job: JobStatus) -> None:
+    _jobs().create(job.job_id, job.model_dump(mode="json"))
+
+
+def _update_job(job_id: str, **fields: Any) -> JobStatus | None:
+    payload = _jobs().update_fields(job_id, **fields)
+    return _job_to_status(payload) if payload else None
+
+
+def _get_job(job_id: str) -> JobStatus | None:
+    payload = _jobs().get(job_id)
+    return _job_to_status(payload) if payload else None
+
+
+def _list_jobs() -> List[JobStatus]:
+    return [_job_to_status(p) for p in _jobs().list()]
 
 DEFAULT_BASE_MODEL = os.environ.get("VALONY_BASE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 # Opt-in override — set VALONY_INFERENCE_BACKEND=ollama to route generation
@@ -683,17 +712,29 @@ _TRAINER_CLASSES = {
 
 
 async def _run_training(job_id: str, req: TrainingJobRequest, config: Dict[str, Any]):
-    job = job_registry[job_id]
-    job.status = "training"
+    # A5: live state lives in the SQLite store so a uvicorn restart
+    # leaves the record intact. Field mutations route through
+    # _update_job which patches the persisted payload atomically.
+    _update_job(job_id, status="training")
+
+    # The trainer's LossHistoryCallback appends to a list reference we
+    # hand it. We keep that list local to the running task and flush
+    # it into the store at the end (and on terminal events). For
+    # mid-training visibility we also flush every Nth callback —
+    # chosen to keep p95 callback overhead tiny while still giving the
+    # UI a near-live curve.
+    loss_history: list[dict[str, Any]] = []
+    flush_every = 5
 
     def progress(p: float):
-        job.progress = p
-        # Surface the most recent step's loss to the UI as it streams in
-        # -- saves the client from having to find it in loss_history.
-        if job.loss_history:
-            last = job.loss_history[-1].get("loss")
+        fields: dict[str, Any] = {"progress": p, "loss_history": loss_history}
+        if loss_history:
+            last = loss_history[-1].get("loss")
             if last is not None:
-                job.current_loss = float(last)
+                fields["current_loss"] = float(last)
+        # Throttle persistence: flush every Nth call instead of every call.
+        if len(loss_history) % flush_every == 0:
+            _update_job(job_id, **fields)
 
     try:
         TrainerCls = _TRAINER_CLASSES[req.training_method]
@@ -705,11 +746,7 @@ async def _run_training(job_id: str, req: TrainingJobRequest, config: Dict[str, 
             dataset_path=req.dataset_path,
             hf_dataset_config=hf_cfg,
             progress_callback=progress,
-            # Share the JobStatus.loss_history list with the trainer so
-            # LossHistoryCallback can append per-step metrics in place.
-            # GET /v1/jobs/{id} returns the same list, giving the UI
-            # a live loss curve via simple polling.
-            loss_history_sink=job.loss_history,
+            loss_history_sink=loss_history,
         )
         result = await asyncio.to_thread(trainer.train)
 
@@ -717,18 +754,26 @@ async def _run_training(job_id: str, req: TrainingJobRequest, config: Dict[str, 
         engine = get_inference_engine(req.base_model)
         engine.register_adapter(config["domain_name"], result["adapter_path"])
 
-        job.status = "completed"
-        job.progress = 1.0
-        job.final_loss = result.get("final_loss")
-        job.backend = result.get("backend")
-        job.template = result.get("template")
-        job.hardware = result.get("hardware")
-        job.adapter_path = result.get("adapter_path")
+        _update_job(
+            job_id,
+            status="completed",
+            progress=1.0,
+            final_loss=result.get("final_loss"),
+            backend=result.get("backend"),
+            template=result.get("template"),
+            hardware=result.get("hardware"),
+            adapter_path=result.get("adapter_path"),
+            loss_history=loss_history,
+        )
         logger.info(f"[{job_id}] ✅ Training complete")
 
     except Exception as e:
-        job.status = "failed"
-        job.error_message = str(e)
+        _update_job(
+            job_id,
+            status="failed",
+            error_message=str(e),
+            loss_history=loss_history,
+        )
         logger.exception(f"[{job_id}] ❌ Training failed")
 
 
@@ -752,28 +797,30 @@ async def create_job(req: TrainingJobRequest, background_tasks: BackgroundTasks)
         raise HTTPException(422, f"Unsupported training method: {req.training_method}")
 
     job_id = str(uuid.uuid4())
-    job_registry[job_id] = JobStatus(
+    job = JobStatus(
         job_id=job_id,
         status="queued",
         progress=0.0,
         method=req.training_method,
         dataset_source="huggingface" if req.hf_dataset else "local",
     )
+    _store_job(job)
     background_tasks.add_task(_run_training, job_id, req, config)
     logger.info(f"Job {job_id} queued | method={req.training_method}")
-    return job_registry[job_id]
+    return job
 
 
 @app.get("/v1/jobs/{job_id}", response_model=JobStatus)
 async def get_job(job_id: str):
-    if job_id not in job_registry:
+    job = _get_job(job_id)
+    if job is None:
         raise HTTPException(404, "Job not found")
-    return job_registry[job_id]
+    return job
 
 
 @app.get("/v1/jobs", response_model=List[JobStatus])
 async def list_jobs():
-    return list(job_registry.values())
+    return _list_jobs()
 
 
 # ──────────────────────────────────────────────────────────────

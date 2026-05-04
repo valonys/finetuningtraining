@@ -315,6 +315,20 @@ class PipelineRunner:
             "finished_at": self._now().isoformat(timespec="seconds"),
         }
         _atomic_write_json(ctx.run_dir / "report.json", report)
+        # A5: mirror the run report into the SQLite RunStore so
+        # observability surfaces (cost / SLO / canary) can query
+        # relationally without parsing the per-run JSONL trees.
+        # Best-effort — a persistence hiccup must not fail the run.
+        try:
+            from app.persistence import default_store
+            default_store().upsert_run(ctx.run_id, {
+                "run_id": ctx.run_id,
+                "domain": ctx.domain,
+                "manifest": ctx.manifest,
+                "report": report,
+            })
+        except Exception as exc:
+            logger.warning(f"⚠️  RunStore mirror failed: {exc}")
         return report
 
     # ── Internals ─────────────────────────────────────────────

@@ -208,13 +208,36 @@ class InferenceManager:
 
     # ── Private ───────────────────────────────────────────────
     def _scan_adapters(self) -> None:
+        # First pass: legacy directory walk under outputs/<domain>/.
+        # Picks up adapters that haven't been registered through the
+        # A3 model registry yet (dev workflows, hand-trained adapters,
+        # etc.).
         outputs_dir = "outputs"
-        if not os.path.isdir(outputs_dir):
-            return
-        for name in os.listdir(outputs_dir):
-            path = os.path.join(outputs_dir, name)
-            if os.path.isdir(path) and os.path.exists(os.path.join(path, "adapter_config.json")):
-                self.lora_registry[name] = path
+        if os.path.isdir(outputs_dir):
+            for name in os.listdir(outputs_dir):
+                path = os.path.join(outputs_dir, name)
+                if os.path.isdir(path) and os.path.exists(
+                    os.path.join(path, "adapter_config.json")
+                ):
+                    self.lora_registry[name] = path
+
+        # A5: prefer the registry's PRODUCTION row when one exists for a
+        # domain. Closes the A3 follow-up — the inference engine now
+        # serves whatever the registry has promoted, not whatever
+        # happens to be on disk. Failures are non-fatal so unit tests /
+        # dev mode without a registry keep working.
+        try:
+            from app.registry import ModelStatus, default_registry
+            registry = default_registry()
+            for v in registry.list(status=ModelStatus.PRODUCTION):
+                if v.adapter_path:
+                    self.lora_registry[v.domain] = v.adapter_path
+                    logger.info(
+                        f"📎 Adapter from registry (PRODUCTION): "
+                        f"{v.domain} → {v.adapter_path} (version={v.model_version})"
+                    )
+        except Exception as exc:
+            logger.debug(f"registry scan skipped: {exc}")
 
     def _init_backend(self, name: str, profile) -> Any:
         if name == "vllm":
