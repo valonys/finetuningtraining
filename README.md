@@ -71,7 +71,6 @@ tests/               177+ unit tests, CI via GitHub Actions
 ```bash
 git clone https://github.com/valonys/finetuningtraining.git
 cd finetuningtraining
-git checkout develop
 
 # Backend
 python3 -m venv .venv && source .venv/bin/activate

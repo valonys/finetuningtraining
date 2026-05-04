@@ -41,9 +41,12 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List
 
+from pathlib import Path
+
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import iterate_in_threadpool
 
 from app import __version__
@@ -1025,4 +1028,66 @@ async def chat_stream(req: ChatRequest):
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# SPA serving (S07) — mount frontend/dist + client-route fallback
+# ──────────────────────────────────────────────────────────────
+# Production: the Dockerfile's frontend-build stage produces
+# /app/frontend/dist and copies it into the runtime image. We mount
+# Vite's hashed bundle under /assets and add a catch-all that serves
+# index.html for any unmatched non-API path so React Router's
+# client-side routes work when a user lands directly on /domains/foo.
+#
+# Dev: when run via `uvicorn app.main:app` without a built frontend,
+# the dist dir doesn't exist. We log a one-line warning and skip the
+# mount entirely — the Vite dev server handles SPA serving in dev.
+#
+# Order matters: this block runs LAST in module load, AFTER every
+# explicit @app.get / @app.post is registered. Starlette matches in
+# registration order, so /v1/... and /healthz win against the
+# catch-all. The catch-all also explicitly refuses to mask API misses
+# so a mistyped /v1/foo returns 404 instead of an HTML SPA shell.
+_FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+_API_PREFIXES = ("v1/", "healthz", "openapi.json", "docs", "redoc")
+
+
+if _FRONTEND_DIST.is_dir():
+    _assets = _FRONTEND_DIST / "assets"
+    if _assets.is_dir():
+        app.mount(
+            "/assets",
+            StaticFiles(directory=_assets),
+            name="frontend-assets",
+        )
+
+    @app.get("/", include_in_schema=False)
+    async def _spa_root():
+        return FileResponse(_FRONTEND_DIST / "index.html")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def _spa_fallback(full_path: str):
+        # API misses must surface as real 404s, not be silently
+        # masked by index.html — that turns mistyped URLs into
+        # confusing "the page works but data is empty" bugs.
+        if full_path.startswith(_API_PREFIXES):
+            raise HTTPException(404, "Not Found")
+        # Path-traversal guard: resolve and confirm we stay in dist.
+        candidate = (_FRONTEND_DIST / full_path).resolve()
+        try:
+            candidate.relative_to(_FRONTEND_DIST.resolve())
+        except ValueError:
+            raise HTTPException(404, "Not Found")
+        if candidate.is_file():
+            return FileResponse(candidate)
+        # Default: client-side route — let React Router handle it.
+        return FileResponse(_FRONTEND_DIST / "index.html")
+
+    logger.info(f"SPA serving enabled from {_FRONTEND_DIST}")
+else:
+    logger.info(
+        f"SPA dist not found at {_FRONTEND_DIST} — skipping static mount "
+        "(run `npm run build` in frontend/ for production, or use the Vite "
+        "dev server on :5173 for local dev)"
     )

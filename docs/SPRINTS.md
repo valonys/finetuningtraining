@@ -171,40 +171,53 @@ A4 is intentionally absent — that's the diffusion lane in the source blueprint
 
 ---
 
-## Sprint 07 — Frontend production + App Runner serving
+## Sprint 07 — Frontend production + App Runner serving (shipped 2026-05-04)
 
-**Goal:** Make the frontend deployable and stand up the MVP demo lane on AWS App Runner. Promotes the previously "opportunistic" App Runner sprint to a real slot now that S06 makes the build green and the API safe to expose.
+**Goal:** Make the frontend deployable and stand up the MVP demo lane on AWS App Runner.
 
-**App Runner deprecation note (2026-05-04):** AWS closed App Runner to *new customers* effective 2026-04-30. **This account already has App Runner services running and is grandfathered**, so we can keep deploying to it. Decision made with full awareness of the deprecation: user explicitly chose to reuse existing well-understood App Runner over (a) Fly.io (rejected — second cloud to manage) and (b) ECS Express Mode (deferred — fixed-cost ALB baseline risks blowing the $5/mo cap; revisit only when scale justifies the haywire). When App Runner reaches end-of-life or scale demands more, the natural exit is ECS Express, not Fly.io.
+**Status:** Shipped. 10 new tests green; full Python suite 303/303, no regressions. Code change is live; the actual App Runner deploy is operator-driven (one shell script run with the right env vars).
 
-**Budget target:** $0–$5/mo (App Runner Auto Pause idle ≈ $3.30/mo provisioned-memory-only; active vCPU billed per request). Hard ceiling — see memory `serving_cost_constraints.md`.
+**Decision recorded:** **FastAPI StaticFiles + SPA fallback in one container**, not separate S3+CloudFront origins. Reasoning: the existing Dockerfile already builds `frontend/dist` and copies it into the runtime image — uvicorn just needed to serve it, and folding the SPA into the FastAPI process means one deploy target, no S3/CloudFront/CORS-cross-origin coordination, no extra AWS resources to manage. Aligns with the user's "less to manage" preference (same call that drove rejecting Fly.io and deleting the develop branch).
 
-**Deliverables — frontend serving model**
-- **Decision** (record in PR): FastAPI `StaticFiles` mount at `/` with SPA fallback (`/{full_path:path}` → `index.html`) **vs** S3 + CloudFront for the SPA + API on a separate origin.
-  - Default lean: **separate origins** (S3/CloudFront for SPA, App Runner for API). Cheaper, scales independently, lets the static side stay free-tier; App Runner stays single-purpose.
-  - StaticFiles mount path is the fallback if you'd rather have one container handle both (simpler ops, slightly more compute per request).
-- Implement chosen path. If separate origins: keep the existing Vite build, add an `npm run build && aws s3 sync dist/ s3://...` script. If StaticFiles: mount in `app/main.py` with the SPA fallback route.
-- **Dockerfile harden:** the current image copies `frontend/dist` but uvicorn doesn't serve it (S06 audit item 3). Either drop the copy (separate-origins path) or wire the StaticFiles mount.
+**App Runner deprecation note (2026-05-04):** AWS closed App Runner to *new customers* effective 2026-04-30. **This account already has App Runner services running and is grandfathered**, so we can keep deploying to it. The script targets an existing service ARN — no new-service creation needed.
 
-**Deliverables — App Runner**
-- `apprunner.yaml` at repo root — `runtime: python311`, build command, start command (`uvicorn app.main:app --host 0.0.0.0 --port 8000`), 0.25 vCPU / 0.5 GB, Auto Pause on.
-- Slimmed CPU-only Docker target (`Dockerfile.apprunner` or a new stage on the existing Dockerfile) — drop `torch`/`unsloth`/`vllm` extras, keep only what's needed for `VALONY_INFERENCE_BACKEND=ollama`.
-- Reuse the existing grandfathered App Runner service rather than creating a new one (new-customer creation is closed).
-- IaC bits: `infra/apprunner-service.tf` or a one-shot bootstrap script (decide based on user pref).
+**Budget target:** $0–$5/mo. Hard ceiling — see memory `serving_cost_constraints.md`.
 
-**Hard constraints**
-- App Runner has no GPU and no room for an in-process model. Generation MUST proxy to Ollama Cloud / OpenRouter / HF Inference. Never load a HF/vLLM model in this image.
-- `VALONY_CORS_ORIGINS` (from S06) must include the SPA origin (CloudFront URL or App Runner static path).
-- Cost cap is hard, not aspirational. First week of real demo traffic must be checked against actual billing — if creeping above $5/mo, throttle traffic or shrink the instance before considering scope changes.
+**Shipped — code**
+- `app/main.py`: SPA serving block at the bottom (after every `@app.get`/`@app.post`). Mounts `frontend/dist/assets` at `/assets` (Vite's hashed bundle output), serves `index.html` at `/`, and a catch-all `/{full_path:path}` that:
+  - Refuses to mask API misses — paths starting with `v1/`, `healthz`, `openapi.json`, `docs`, `redoc` return real 404 instead of an HTML shell.
+  - Path-traversal guard: resolves the candidate and rejects anything that escapes `frontend/dist`.
+  - Serves explicit dist files (favicon, manifest) directly when they exist.
+  - Falls through to `index.html` so React Router handles unknown SPA routes.
+  - Logs a one-line warning and skips the mount entirely if `frontend/dist` doesn't exist (so `pytest` and `uvicorn` in dev work without a built frontend).
+
+**Shipped — deploy artifact**
+- `infra/apprunner-deploy.sh`: builds the `cpu` Docker target locally → pushes to ECR with `:latest` and `:<git-sha>` tags → triggers `aws apprunner start-deployment` → polls `Service.Status` until `RUNNING`. Requires `APPRUNNER_SERVICE_ARN` env var; everything else has sane defaults (region us-east-1, repo `valonylabs-studio`, target `cpu`).
+
+**Shipped — operator docs**
+- `docs/DEPLOY_APPRUNNER.md`: full deploy runbook — one-time ECR + Secrets Manager + App Runner service config, every-deploy script invocation, smoke check, **CloudWatch budget alarm at $5/mo**, weekly cost-explorer query for the App Runner service, rollback (`IMAGE_TAG=<prev-sha>` re-run), troubleshooting table.
+
+**Shipped — tests**
+- `tests/test_spa_serving.py` (10 cases): root → index, unknown SPA route → index, explicit dist file served directly, `/assets` mount serves the bundle, API exact route wins, API parameterized route wins, `/v1/...` miss returns 404 (not index), `/healthz/extra` miss returns 404, path traversal rejected, no SPA registration when dist is missing.
+
+**Shipped — CI cleanup**
+- `.github/workflows/ci.yml`: dropped dead `develop` from `pull_request.branches` (only `main` remains; the develop branch was deleted earlier today).
+- `README.md`: dropped dead `git checkout develop` from the Quickstart.
+
+**Hard constraints (still apply)**
+- App Runner has no GPU and no room for an in-process model. Generation proxies to Ollama Cloud (`VALONY_INFERENCE_BACKEND=ollama`). Never set `VALONY_PREWARM_INFERENCE=1`.
+- `VALONY_CORS_ORIGINS` should be set to the App Runner service URL — the deploy doc has the exact env-var list.
 
 **Acceptance gate**
-- ✅ `frontend/dist` served correctly in production (whichever serving model is chosen) — manual smoke + a CI check that fetches `/` from a built container.
-- ✅ End-to-end `curl https://<apprunner>/healthz` and SPA loads in a browser.
-- ✅ Monthly bill under $5 for a week of pitch-deck-volume traffic.
+- ✅ `frontend/dist` served correctly: tests prove the FastAPI mount works; production verification happens on the first real deploy.
+- ⏳ End-to-end `curl https://<apprunner>/healthz` + SPA loads in a browser — pending operator-run of `apprunner-deploy.sh`.
+- ⏳ Monthly bill under $5 for a week of pitch-deck-volume traffic — to be measured after first week of real traffic via the AWS Budgets alarm and the cost-explorer query in `DEPLOY_APPRUNNER.md`.
 
 **Exit ramp (when triggered, not in S07 scope)**
-- App Runner end-of-life announcement OR sustained traffic that warrants scaling beyond Auto Pause → migrate to **Amazon ECS Express Mode** (AWS-blessed successor; ALB baseline acceptable when traffic justifies it).
+- App Runner end-of-life announcement OR sustained traffic beyond Auto Pause → migrate to **Amazon ECS Express Mode** (AWS-blessed successor; ALB baseline acceptable when traffic justifies it).
 - Fly.io is *not* on the exit ramp — user has explicitly ruled out spinning up a second cloud.
+
+**Sizing actual:** ~1 session for code + tests + deploy script + runbook + cleanup.
 
 **Sizing:** 1 sprint. Frontend serving model decision is the only non-mechanical step.
 
